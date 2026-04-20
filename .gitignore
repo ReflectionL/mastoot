@@ -1,0 +1,11 @@
+/target
+Cargo.lock.bak
+*.swp
+*.swo
+.DS_Store
+.vscode/
+.idea/
+# Personal iteration log — not shared
+UPDATE_LOG.md
+# Claude Code per-machine settings
+.claude/settings.local.json
