@@ -7,6 +7,7 @@ description = "An aesthetically-driven Mastodon TUI client"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
 repository = "https://github.com/ReflectionL/mastoot"
+homepage = "https://github.com/ReflectionL/mastoot"
 keywords = ["mastodon", "tui", "ratatui", "fediverse"]
 categories = ["command-line-utilities"]
 
@@ -110,3 +111,8 @@ large_enum_variant = "allow"
 lto = "thin"
 codegen-units = 1
 strip = "symbols"
+
+# The profile that 'dist' will build with
+[profile.dist]
+inherits = "release"
+lto = "thin"
