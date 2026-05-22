@@ -13,10 +13,12 @@ use std::io;
 use anyhow::{Context, Result};
 use crossterm::event::{
     Event as CEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
+    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    supports_keyboard_enhancement,
 };
 use futures::StreamExt;
 use ratatui::Terminal;
@@ -1762,11 +1764,28 @@ fn enter_terminal() -> Result<Term> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
+    // Kitty keyboard protocol: lets the terminal distinguish Ctrl+Enter
+    // from plain Enter (and other modified specials). Without this most
+    // terminals collapse both to a bare `\r`, so our Ctrl+Enter submit
+    // binding gets reported as KeyCode::Enter with no modifier and the
+    // textarea inserts a newline instead. Probed first; only pushed on
+    // terminals that advertise support (kitty / WezTerm / Ghostty /
+    // foot / Konsole / iTerm2 with CSI-u enabled). Apple Terminal etc.
+    // are left untouched. Failures are non-fatal.
+    if supports_keyboard_enhancement().unwrap_or(false) {
+        let _ = execute!(
+            stdout,
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES),
+        );
+    }
     let backend = CrosstermBackend::new(stdout);
     Terminal::new(backend).map_err(Into::into)
 }
 
 fn leave_terminal(term: &mut Term) {
+    // Best-effort pop — if the push above was skipped or the terminal
+    // ignored it, this is a no-op.
+    let _ = execute!(term.backend_mut(), PopKeyboardEnhancementFlags);
     let _ = disable_raw_mode();
     let _ = execute!(term.backend_mut(), LeaveAlternateScreen);
     let _ = term.show_cursor();
@@ -1777,6 +1796,7 @@ fn leave_terminal(term: &mut Term) {
 fn install_panic_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
+        let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
         prev(info);
