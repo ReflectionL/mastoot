@@ -280,23 +280,34 @@ async fn handle_action(ctx: Ctx, action: Action) {
             content_warning,
             sensitive,
             visibility,
+            edit_of,
         } => {
-            let posted = post_status(
-                &ctx,
-                text,
-                in_reply_to_id,
-                quote_id,
-                content_warning,
-                sensitive,
-                visibility,
-            )
-            .await;
-            if posted {
+            let mut draft = StatusDraft::new(text);
+            draft.in_reply_to_id = in_reply_to_id;
+            draft.quote_id = quote_id;
+            draft.spoiler_text = content_warning;
+            draft.sensitive = sensitive;
+            draft.visibility = Some(match visibility {
+                Visibility::Public => ApiVisibility::Public,
+                Visibility::Unlisted => ApiVisibility::Unlisted,
+                Visibility::Private => ApiVisibility::Private,
+                Visibility::Direct => ApiVisibility::Direct,
+            });
+            if let Some(id) = edit_of {
+                edit_status(&ctx, &id, &draft).await;
+            } else if post_status(&ctx, &draft).await {
                 // Pull a fresh home timeline so the just-posted
                 // status shows up immediately.
                 load_timeline(&ctx, TimelineKind::Home, None, false).await;
             }
         }
+        Action::LoadSource(id) => match ctx.client.status_source(&id).await {
+            Ok(src) => {
+                send(&ctx.events, Event::StatusSource(src)).await;
+                note_api_ok(&ctx).await;
+            }
+            Err(e) => report_api_error(&ctx, "edit", &e).await,
+        },
         Action::LoadProfile { id, max_id } => load_profile(&ctx, id, max_id).await,
         Action::LoadRelationship(id) => load_relationship(&ctx, id).await,
         Action::Follow(id) => follow_action(&ctx, id, true).await,
@@ -304,6 +315,18 @@ async fn handle_action(ctx: Ctx, action: Action) {
         Action::LoadAccountList { id, kind, max_id } => {
             load_account_list(&ctx, id, kind, max_id).await;
         }
+        Action::LoadStatus(id) => match ctx.client.status(&id).await {
+            Ok(s) => {
+                send(&ctx.events, Event::StatusLoaded(s)).await;
+                note_api_ok(&ctx).await;
+            }
+            Err(e) => {
+                // A missing parent is not worth a toast; the card just
+                // keeps its plain "replying to @…" hint.
+                send(&ctx.events, Event::StatusLoadFailed(id)).await;
+                note_api_error(&ctx, &e).await;
+            }
+        },
         Action::Search { query } => {
             let params = crate::api::endpoints::SearchParams {
                 q: &query,
@@ -541,28 +564,43 @@ async fn load_timeline(ctx: &Ctx, kind: TimelineKind, max_id: Option<String>, ap
         local: matches!(kind, TimelineKind::Local),
         ..Default::default()
     };
+    // Favourites / bookmarks paginate by an internal id carried in the
+    // `Link` header, not by status id — their "oldest" cursor is that
+    // opaque token.
+    let link_paged = matches!(kind, TimelineKind::Favourites | TimelineKind::Bookmarks);
     let result = match kind {
         TimelineKind::Home => ctx.client.home_timeline(&params).await,
         TimelineKind::Local | TimelineKind::Federated => ctx.client.public_timeline(&params).await,
+        TimelineKind::Favourites | TimelineKind::Bookmarks => {
+            let p = AccountListParams {
+                max_id: params.max_id.clone(),
+                since_id: None,
+                limit: params.limit,
+            };
+            if matches!(kind, TimelineKind::Favourites) {
+                ctx.client.favourites(&p).await
+            } else {
+                ctx.client.bookmarks(&p).await
+            }
+        }
         TimelineKind::Notifications => {
             load_notifications(ctx, params.max_id, appended).await;
             return;
         }
-        _ => {
-            toast(
-                &ctx.events,
-                ToastLevel::Info,
-                format!("{}: not available yet", kind.label()),
-            )
-            .await;
-            return;
-        }
+        TimelineKind::Profile => return,
     };
     match result {
         Ok(page) => {
             {
                 let mut st = lock(&ctx.state);
-                let oldest = page.items.last().map(|s| s.id.clone());
+                let oldest = if link_paged {
+                    page.next
+                        .as_ref()
+                        .and_then(|c| c.max_id.clone())
+                        .map(StatusId::new)
+                } else {
+                    page.items.last().map(|s| s.id.clone())
+                };
                 if appended {
                     st.note_page(kind, None, oldest);
                 } else {
@@ -878,29 +916,22 @@ async fn report_api_error(ctx: &Ctx, verb: &str, err: &ApiError) {
     note_api_error(ctx, err).await;
 }
 
-async fn post_status(
-    ctx: &Ctx,
-    text: String,
-    in_reply_to_id: Option<StatusId>,
-    quote_id: Option<StatusId>,
-    content_warning: Option<String>,
-    sensitive: bool,
-    visibility: Visibility,
-) -> bool {
-    let has_quote = quote_id.is_some();
-    let mut draft = StatusDraft::new(text);
-    draft.in_reply_to_id = in_reply_to_id;
-    draft.quote_id = quote_id;
-    draft.spoiler_text = content_warning;
-    draft.sensitive = sensitive;
-    draft.visibility = Some(match visibility {
-        Visibility::Public => ApiVisibility::Public,
-        Visibility::Unlisted => ApiVisibility::Unlisted,
-        Visibility::Private => ApiVisibility::Private,
-        Visibility::Direct => ApiVisibility::Direct,
-    });
+/// `PUT /statuses/{id}`. The server returns the edited status, which
+/// flows through the normal `StatusUpdated` patch path.
+async fn edit_status(ctx: &Ctx, id: &StatusId, draft: &StatusDraft) {
+    match ctx.client.edit_status(id, draft).await {
+        Ok(status) => {
+            send(&ctx.events, Event::StatusUpdated(status)).await;
+            toast(&ctx.events, ToastLevel::Info, "edited".into()).await;
+            note_api_ok(ctx).await;
+        }
+        Err(e) => report_api_error(ctx, "edit", &e).await,
+    }
+}
 
-    match ctx.client.post_status(&draft).await {
+async fn post_status(ctx: &Ctx, draft: &StatusDraft) -> bool {
+    let has_quote = draft.quote_id.is_some();
+    match ctx.client.post_status(draft).await {
         Ok(status) => {
             let msg = if has_quote {
                 "quote posted"

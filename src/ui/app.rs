@@ -7,7 +7,7 @@
 //! - state-task events ([`crate::state::Event`])
 //! - a 30 s background tick (refreshes relative timestamps)
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::time::Instant;
 
@@ -118,6 +118,7 @@ async fn main_loop(term: &mut Term, app: &mut App, handle: &mut Handle) -> Resul
             }
             Some(ev) = handle.events.recv() => {
                 app.handle_event(ev);
+                app.flush_pending(&handle.actions).await;
             }
             _ = tick.tick() => {
                 app.on_tick();
@@ -149,6 +150,18 @@ struct App {
     absolute_time: bool,
     /// Blank rows between posts; `D` flips 1 ↔ 2 at runtime.
     density: usize,
+    /// Parents of replies, fetched on demand for the `↪ @…: "…"`
+    /// preview line. Keyed by the parent's id.
+    parents: HashMap<StatusId, Status>,
+    /// Parent ids with a fetch in flight (or that failed — no retry
+    /// storms on a deleted parent).
+    parents_requested: HashSet<StatusId>,
+    /// Actions queued by event handlers (which have no channel in
+    /// hand); the main loop flushes them after each event.
+    pending_actions: Vec<Action>,
+    /// `e` was pressed on this post; when its source arrives, open
+    /// compose in edit mode with this visibility.
+    pending_edit: Option<(StatusId, state::Visibility)>,
     active: TimelineKind,
     screens: HashMap<TimelineKind, TimelineScreen>,
     timelines: HashMap<TimelineKind, Vec<Status>>,
@@ -244,6 +257,8 @@ impl App {
             TimelineKind::Local,
             TimelineKind::Federated,
             TimelineKind::Notifications,
+            TimelineKind::Favourites,
+            TimelineKind::Bookmarks,
         ] {
             screens.insert(k, TimelineScreen::new(k));
         }
@@ -255,6 +270,10 @@ impl App {
             nerd_font,
             absolute_time,
             density: 1,
+            parents: HashMap::new(),
+            parents_requested: HashSet::new(),
+            pending_actions: Vec::new(),
+            pending_edit: None,
             active: TimelineKind::Home,
             screens,
             timelines: HashMap::new(),
@@ -273,6 +292,22 @@ impl App {
             music: MusicCache::new(),
             cfg,
             splash: true,
+        }
+    }
+
+    /// Send whatever event handlers queued up.
+    async fn flush_pending(&mut self, tx: &tokio::sync::mpsc::Sender<Action>) {
+        for a in self.pending_actions.drain(..) {
+            let _ = tx.send(a).await;
+        }
+    }
+
+    /// Queue parent fetches for the replies in `statuses` whose parent
+    /// is neither in the same list nor already cached / requested.
+    fn request_parents(&mut self, statuses: &[Status]) {
+        for pid in missing_parents(statuses, &self.parents, &self.parents_requested) {
+            self.parents_requested.insert(pid.clone());
+            self.pending_actions.push(Action::LoadStatus(pid));
         }
     }
 
@@ -433,7 +468,7 @@ impl App {
                 return true;
             }
             Mode::Search(mut state) => {
-                if let KeyCode::Char('1' | '2' | '3' | '4' | '5') = key.code {
+                if let KeyCode::Char('1' | '2' | '3' | '4' | '5' | '6' | '7') = key.code {
                     // Tab switch — fall through to timeline keys.
                     self.mode = Mode::Timeline;
                 } else {
@@ -498,6 +533,7 @@ impl App {
                                 content_warning: draft.content_warning,
                                 sensitive: draft.sensitive,
                                 visibility: draft.visibility,
+                                edit_of: draft.edit_of,
                             })
                             .await;
                         // If we came from a detail page and this was a
@@ -551,7 +587,7 @@ impl App {
                         self.mode = Mode::Profile(state);
                         return true;
                     }
-                    KeyCode::Char('1' | '2' | '3' | '4' | '5') => {
+                    KeyCode::Char('1' | '2' | '3' | '4' | '5' | '6' | '7') => {
                         // Restore mode to Timeline so the tab handlers
                         // below see the right starting state, then let
                         // the timeline-mode key table run.
@@ -609,7 +645,7 @@ impl App {
                 // Fall through to timeline keys (tab switch).
             }
             Mode::AccountList(mut state) => {
-                if let KeyCode::Char('1' | '2' | '3' | '4' | '5') = key.code {
+                if let KeyCode::Char('1' | '2' | '3' | '4' | '5' | '6' | '7') = key.code {
                     // Tab switch — fall through to timeline keys.
                     self.mode = Mode::Timeline;
                 } else {
@@ -706,6 +742,8 @@ impl App {
             KeyCode::Char('3') => self.switch_to(TimelineKind::Federated, tx).await,
             KeyCode::Char('4') => self.switch_to(TimelineKind::Notifications, tx).await,
             KeyCode::Char('5') => self.open_self_profile(tx).await,
+            KeyCode::Char('6') => self.switch_to(TimelineKind::Favourites, tx).await,
+            KeyCode::Char('7') => self.switch_to(TimelineKind::Bookmarks, tx).await,
             KeyCode::Char('f') => {
                 if let Some(action) = self.toggle_favourite_optimistic() {
                     let _ = tx.send(action).await;
@@ -804,6 +842,19 @@ impl App {
             KeyCode::Char('d') => {
                 if let Some(id) = self.selected_own_status_id() {
                     self.push_mode(Mode::DeleteConfirm(id));
+                }
+            }
+            KeyCode::Char('e') => {
+                // Edit own post: fetch the original text first; the
+                // `StatusSource` event opens compose in edit mode.
+                if let Some(id) = self.selected_own_status_id() {
+                    let vis = self
+                        .current_target()
+                        .map_or(state::Visibility::Public, |t| {
+                            api_to_state_vis(t.visibility)
+                        });
+                    self.pending_edit = Some((id.clone(), vis));
+                    let _ = tx.send(Action::LoadSource(id)).await;
                 }
             }
             KeyCode::Char('u') => {
@@ -1126,6 +1177,33 @@ impl App {
                 if let Some(screen) = self.screens.get_mut(&kind) {
                     screen.on_items_changed(len, appended);
                 }
+                if kind == TimelineKind::Home {
+                    let wanted = missing_parents(
+                        self.timelines.get(&kind).map_or(&[][..], Vec::as_slice),
+                        &self.parents,
+                        &self.parents_requested,
+                    );
+                    for pid in wanted {
+                        self.parents_requested.insert(pid.clone());
+                        self.pending_actions.push(Action::LoadStatus(pid));
+                    }
+                }
+            }
+            Event::StatusSource(src) => {
+                if let Some((id, vis)) = self.pending_edit.take()
+                    && id == src.id
+                    && !matches!(self.mode, Mode::Compose(_) | Mode::ComposeConfirmDiscard(_))
+                {
+                    self.push_mode(Mode::Compose(ComposeState::edit(src, vis, self.max_chars)));
+                }
+            }
+            Event::StatusLoaded(status) => {
+                self.parents_requested.remove(&status.id);
+                self.parents.insert(status.id.clone(), status);
+            }
+            Event::StatusLoadFailed(id) => {
+                // Stays in `parents_requested` on purpose: don't retry.
+                tracing::debug!(%id, "parent status unavailable");
             }
             Event::StatusUpdated(status) => {
                 // The update may apply to a status that lives inside a
@@ -1187,6 +1265,12 @@ impl App {
                     && p.account_id == account.id
                 {
                     p.on_loaded(account, statuses, appended);
+                    let wanted =
+                        missing_parents(&p.statuses, &self.parents, &self.parents_requested);
+                    for pid in wanted {
+                        self.parents_requested.insert(pid.clone());
+                        self.pending_actions.push(Action::LoadStatus(pid));
+                    }
                 }
             }
             Event::RelationshipLoaded(rel) => {
@@ -1340,10 +1424,13 @@ impl App {
                 if slot.iter().any(|s| s.id == status.id) {
                     return;
                 }
-                slot.insert(0, status);
+                slot.insert(0, status.clone());
                 let new_len = slot.len();
                 if let Some(screen) = self.screens.get_mut(&kind) {
                     screen.on_prepended(1, new_len);
+                }
+                if kind == TimelineKind::Home {
+                    self.request_parents(std::slice::from_ref(&status));
                 }
             }
             Event::NotificationsUpdated { items, appended } => {
@@ -1411,6 +1498,8 @@ impl App {
                 // or similar from the outgoing session.
                 self.timelines.clear();
                 self.notifications.clear();
+                self.parents.clear();
+                self.parents_requested.clear();
                 self.back_stack.clear();
                 self.active = TimelineKind::Home;
                 for screen in self.screens.values_mut() {
@@ -1533,6 +1622,7 @@ impl App {
                     layout[1],
                     &self.theme,
                     prefs,
+                    &self.parents,
                     &mut self.music,
                     &mut self.images,
                 );
@@ -1750,6 +1840,8 @@ impl App {
             // Profile is a Mode, not a timeline kind; matched via
             // `tab_5_active()` below.
             (None, "5 Profile"),
+            (Some(TimelineKind::Favourites), "6 Favourites"),
+            (Some(TimelineKind::Bookmarks), "7 Bookmarks"),
         ];
         let profile_active = self.tab_5_active();
         let mut spans: Vec<Span<'static>> = Vec::with_capacity(labels.len() * 2);
@@ -1796,6 +1888,7 @@ impl App {
                 items,
                 &self.theme,
                 prefs,
+                &self.parents,
                 &mut self.music,
                 &mut self.images,
             );
@@ -1927,6 +2020,7 @@ impl App {
             "  Esc           quit (asks first) · Ctrl+C quits at once",
             "  ?             toggle this help",
             "  1 / 2 / 3 / 4 / 5  Home / Local / Federated / Notifications / Profile",
+            "  6 / 7         Favourites / Bookmarks",
             "  u             open profile of selected post's author",
             "  F             (in other-user profile) follow / unfollow",
             "  o / O         (in profile) open followers / following list",
@@ -1943,6 +2037,7 @@ impl App {
             "  r             reply to selected",
             "  q             quote selected (Mastodon 4.5+ native quote)",
             "  d             delete own post (Enter / Esc to confirm)",
+            "  e             edit own post",
             "  l / Enter     open thread (status detail)",
             "  Q             open quoted post (when selected post is a quote)",
             "  o             open in browser (in profile: followers)",
@@ -1996,6 +2091,36 @@ impl App {
             .block(block);
         frame.render_widget(p, rect);
     }
+}
+
+/// Parent ids worth fetching for the reply previews in `statuses`:
+/// replies whose parent is neither in the same list nor already
+/// cached / requested. Self-replies (thread continuations) are
+/// skipped — the card says "in a thread" and that's enough.
+fn missing_parents(
+    statuses: &[Status],
+    parents: &HashMap<StatusId, Status>,
+    requested: &HashSet<StatusId>,
+) -> Vec<StatusId> {
+    let mut out: Vec<StatusId> = Vec::new();
+    for s in statuses {
+        let shown = s.reblog.as_deref().unwrap_or(s);
+        let Some(pid) = shown.in_reply_to_id.as_ref() else {
+            continue;
+        };
+        if shown.in_reply_to_account_id.as_ref() == Some(&shown.account.id)
+            || parents.contains_key(pid)
+            || requested.contains(pid)
+            || out.contains(pid)
+            || statuses
+                .iter()
+                .any(|o| o.reblog.as_deref().unwrap_or(o).id == *pid)
+        {
+            continue;
+        }
+        out.push(pid.clone());
+    }
+    out
 }
 
 /// Reverse the optimistic flip applied earlier when a server action

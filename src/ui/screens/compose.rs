@@ -38,7 +38,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
 use crate::api::html;
-use crate::api::models::StatusId;
+use crate::api::models::{StatusId, StatusSource};
 use crate::icons;
 use crate::state::Visibility;
 use crate::ui::Theme;
@@ -82,6 +82,8 @@ pub struct ComposeState {
     /// `reply` in practice — quoting + replying in the same post isn't
     /// a pattern we support yet.
     quote: Option<QuoteContext>,
+    /// Editing an existing post rather than writing a new one.
+    edit_of: Option<StatusId>,
     focus: Focus,
     max_chars: usize,
 }
@@ -106,6 +108,7 @@ pub struct ComposeDraft {
     pub content_warning: Option<String>,
     pub sensitive: bool,
     pub visibility: Visibility,
+    pub edit_of: Option<StatusId>,
 }
 
 impl ComposeState {
@@ -141,6 +144,21 @@ impl ComposeState {
         Self::with(None, Some(quote), None, Visibility::Public, max_chars)
     }
 
+    /// Edit one of the user's own posts. Body and CW are the author's
+    /// original text (from `/statuses/:id/source`); visibility can't
+    /// be changed by an edit on Mastodon, so the footer shows the
+    /// post's current one.
+    #[must_use]
+    pub fn edit(source: StatusSource, visibility: Visibility, max_chars: usize) -> Self {
+        let mut me = Self::with(None, None, Some(source.text), visibility, max_chars);
+        if !source.spoiler_text.trim().is_empty() {
+            me.cw_enabled = true;
+            me.spoiler = TextArea::from_text(source.spoiler_text.trim());
+        }
+        me.edit_of = Some(source.id);
+        me
+    }
+
     fn with(
         reply: Option<ReplyContext>,
         quote: Option<QuoteContext>,
@@ -158,6 +176,7 @@ impl ComposeState {
             visibility: vis,
             reply,
             quote,
+            edit_of: None,
             focus: Focus::Body,
             max_chars,
         }
@@ -203,6 +222,7 @@ impl ComposeState {
             sensitive: spoiler.is_some(),
             content_warning: spoiler,
             visibility: self.visibility,
+            edit_of: self.edit_of.clone(),
         })
     }
 
@@ -323,7 +343,9 @@ impl ComposeState {
     }
 
     fn render_title(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-        let label = if self.reply.is_some() {
+        let label = if self.edit_of.is_some() {
+            "Edit"
+        } else if self.reply.is_some() {
             "Reply"
         } else if self.quote.is_some() {
             "Quote"

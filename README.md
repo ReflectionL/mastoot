@@ -16,7 +16,8 @@ Daily-usable. Home / Local / Federated / Notifications / Profile, threads,
 compose / reply / quote / delete, favourite / boost / bookmark, follow lists,
 multi-account switching, inline images (kitty / iTerm2 / Sixel / halfblocks),
 SSE live updates with polling fallback, Apple Music link cards, polls,
-link previews, search (accounts · hashtags · posts), Markdown-style
+link previews, search (accounts · hashtags · posts), threaded replies with
+reply previews, favourites / bookmarks, post editing, Markdown-style
 formatting from forks that send it.
 
 Not done: custom-emoji images (shortcodes show dimmed), media upload,
@@ -39,12 +40,13 @@ Other subcommands: `login`, `logout`, `whoami`, `accounts`, `switch <handle>`.
 | Key | Action |
 | --- | --- |
 | `1` `2` `3` `4` `5` | Home / Local / Federated / Notifications / your profile |
+| `6` `7` | your favourites / bookmarks |
 | `j` `k` `gg` `G` | move · top · bottom |
 | `l` `Enter` | open thread |
 | `h` `Esc` | back (at the top level, `Esc` asks before quitting; `Ctrl+C` quits at once) |
 | `f` `b` `B` | favourite · boost · force un-boost |
 | `c` `r` `q` | new post · reply · quote |
-| `d` | delete your own post (confirms) |
+| `d` `e` | delete / edit your own post |
 | `u` | author's profile |
 | `o` `y` | open in browser · copy link |
 | `Q` | open the quoted post |
@@ -91,6 +93,19 @@ Tokens live in the OS keyring, not in the file. Logs go to
   else gets half-block art. `media_render = "text_only"` shows alt text only.
 - Copy link (`y`) uses OSC 52, so it works over SSH in the terminals above.
 - A Nerd Font is assumed for icons; set `nerd_font = false` otherwise.
+
+## Development
+
+```bash
+cargo test                      # unit tests + golden-screen tests (no terminal needed)
+cargo clippy --all-targets -- -D warnings
+```
+
+`scripts/tui_snapshot.py` drives the real binary in a pseudo-terminal and
+dumps the screen as text (`pip install pyte`); handy for eyeballing a change
+against a live account. Each rebuilt binary re-triggers the macOS Keychain
+prompt; `scripts/codesign-dev.sh` signs it with a self-signed identity so the
+approval sticks (setup steps in the script).
 
 ## License
 

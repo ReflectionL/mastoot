@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::ApiErrorCategory;
 use crate::api::models::{
-    Account, AccountId, Notification, Relationship, SearchResults, Status, StatusId,
+    Account, AccountId, Notification, Relationship, SearchResults, Status, StatusId, StatusSource,
 };
 use crate::state::TimelineKind;
 
@@ -65,7 +65,13 @@ pub enum Action {
         content_warning: Option<String>,
         sensitive: bool,
         visibility: Visibility,
+        /// `Some(id)` → `PUT /statuses/{id}` (edit) instead of a new
+        /// post.
+        edit_of: Option<StatusId>,
     },
+    /// Fetch the original text of one of the user's own posts so it
+    /// can be edited.
+    LoadSource(StatusId),
     /// User toggled live-update mode. The state task spawns / aborts
     /// the appropriate background loop and broadcasts a new
     /// [`StreamState`] so the UI indicator stays in sync.
@@ -81,6 +87,9 @@ pub enum Action {
         handle: String,
         token: SecretString,
     },
+    /// Fetch one status by id — used to resolve the parent of a reply
+    /// for the timeline's reply preview. Quiet on failure.
+    LoadStatus(StatusId),
     /// `/api/v2/search` for `query` (accounts + hashtags + statuses).
     Search {
         query: String,
@@ -184,6 +193,13 @@ pub enum Event {
         action: FailedAction,
     },
     NotificationReceived(Notification),
+    /// Result of [`Action::LoadStatus`].
+    StatusLoaded(Status),
+    /// Result of [`Action::LoadSource`]; the UI opens compose in edit
+    /// mode with it.
+    StatusSource(StatusSource),
+    /// [`Action::LoadStatus`] failed (deleted / private / gone).
+    StatusLoadFailed(StatusId),
     /// Result of [`Action::Search`]. `query` is echoed so a stale
     /// reply can't overwrite a newer search.
     SearchResults {

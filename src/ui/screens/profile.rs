@@ -413,12 +413,14 @@ impl ProfileScreen {
         out
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn render(
         &mut self,
         frame: &mut Frame<'_>,
         area: Rect,
         theme: &Theme,
         prefs: RenderPrefs,
+        parents: &std::collections::HashMap<crate::api::models::StatusId, Status>,
         music: &mut MusicCache,
         images_cache: &mut ImageCache,
     ) {
@@ -454,8 +456,15 @@ impl ProfileScreen {
                 show_reply_hint: true,
                 ..prefs.card_opts()
             };
-            let block =
-                status_card::render_blocks(status, theme, opts, inner_width, Some(&mut *music));
+            let parent = status_card::find_parent(status, &self.statuses, parents);
+            let block = status_card::render_blocks(
+                status,
+                theme,
+                opts,
+                inner_width,
+                Some(&mut *music),
+                parent,
+            );
             let start = lines.len() as u16;
             let len = block.lines.len() as u16;
             for ov in block.image_overlays {

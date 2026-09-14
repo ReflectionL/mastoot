@@ -8,7 +8,7 @@
 //! Selection traverses the entire combined list so `f` / `b` / `r` can
 //! act on any post in the thread, not just the focal.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -44,8 +44,12 @@ pub struct DetailState {
     focal: Status,
     /// Older posts up the reply chain, oldest first.
     ancestors: Vec<Status>,
-    /// Replies (flat for now), ordered as the server returned them.
+    /// Replies, ordered as the server returned them (a depth-first
+    /// walk of the reply tree).
     descendants: Vec<Status>,
+    /// Nesting depth of each descendant: 1 = direct reply to the
+    /// focal, 2 = reply to a reply, … Drives the indent.
+    depths: Vec<u8>,
     /// Cursor index over `[ancestors, focal, descendants]`.
     pub selected: usize,
     pub scroll: u16,
@@ -67,6 +71,7 @@ impl DetailState {
             focal,
             ancestors: Vec::new(),
             descendants: Vec::new(),
+            depths: Vec::new(),
             selected: 0,
             scroll: 0,
             last_g: false,
@@ -86,9 +91,43 @@ impl DetailState {
     pub fn on_context_loaded(&mut self, ancestors: Vec<Status>, descendants: Vec<Status>) {
         self.ancestors = ancestors;
         self.descendants = descendants;
+        self.recompute_depths();
         self.loading = false;
         self.selected = self.ancestors.len(); // focal
         self.scroll = 0;
+    }
+
+    /// Walk `descendants` in server order and derive each reply's
+    /// depth from its parent's. A reply whose parent isn't in the
+    /// thread (deleted, filtered) counts as a direct reply.
+    fn recompute_depths(&mut self) {
+        let mut depth_of: HashMap<&StatusId, u8> = HashMap::new();
+        depth_of.insert(&self.focal.id, 0);
+        let mut depths = Vec::with_capacity(self.descendants.len());
+        for s in &self.descendants {
+            let d = s
+                .in_reply_to_id
+                .as_ref()
+                .and_then(|p| depth_of.get(p))
+                .map_or(1, |d| d.saturating_add(1));
+            depth_of.insert(&s.id, d);
+            depths.push(d);
+        }
+        self.depths = depths;
+    }
+
+    /// Columns of indent for descendant `i` (0 for the focal and
+    /// ancestors). Two columns per level, capped so deep threads
+    /// don't squeeze the text into a sliver.
+    fn indent_for(&self, idx: usize) -> u16 {
+        const PER_LEVEL: u16 = 2;
+        const MAX_LEVELS: u16 = 4;
+        let n_anc = self.ancestors.len();
+        if idx <= n_anc {
+            return 0;
+        }
+        let depth = self.depths.get(idx - n_anc - 1).copied().unwrap_or(1);
+        u16::from(depth.saturating_sub(1)).min(MAX_LEVELS) * PER_LEVEL
     }
 
     /// Patch a status that just changed server-side into whichever slot
@@ -136,6 +175,7 @@ impl DetailState {
         self.ancestors.retain(|s| !hits(s));
         self.descendants.retain(|s| !hits(s));
         if self.total() != before {
+            self.recompute_depths();
             self.selected = self.selected.min(self.total() - 1);
         }
         false
@@ -330,8 +370,14 @@ impl DetailState {
                 show_images: images.enabled(),
                 ..prefs.card_opts()
             };
-            let block =
-                status_card::render_blocks(&self.focal, theme, opts, inner_width, Some(music));
+            let block = status_card::render_blocks(
+                &self.focal,
+                theme,
+                opts,
+                inner_width,
+                Some(music),
+                None,
+            );
             let preface = lines.len() as u16;
             lines.extend(block.lines);
             let p = Paragraph::new(lines)
@@ -380,8 +426,16 @@ impl DetailState {
             // / spacious cards still only render when `show_images`
             // is true (focal-only for now), so non-focal cards never
             // trigger artwork downloads.
-            let block =
-                status_card::render_blocks(status, theme, opts, inner_width, Some(&mut *music));
+            let indent = self.indent_for(idx);
+            let mut block = status_card::render_blocks(
+                status,
+                theme,
+                opts,
+                inner_width.saturating_sub(indent),
+                Some(&mut *music),
+                None,
+            );
+            block.indent(indent);
             let card_start = lines.len() as u16;
             let card_len = block.lines.len() as u16;
             for ov in block.image_overlays {
@@ -508,6 +562,30 @@ mod tests {
         let f = d.selected_target().unwrap();
         assert_eq!(f.favourited, Some(false));
         assert_eq!(f.favourites_count, 0);
+    }
+
+    #[test]
+    fn reply_depths_follow_in_reply_to_chain() {
+        let mut d = DetailState::new(fake("focal"));
+        let mut r1 = fake("r1");
+        r1.in_reply_to_id = Some(StatusId::new("focal"));
+        let mut r1a = fake("r1a");
+        r1a.in_reply_to_id = Some(StatusId::new("r1"));
+        let mut r1a1 = fake("r1a1");
+        r1a1.in_reply_to_id = Some(StatusId::new("r1a"));
+        let mut r2 = fake("r2");
+        r2.in_reply_to_id = Some(StatusId::new("focal"));
+        let mut orphan = fake("orphan");
+        orphan.in_reply_to_id = Some(StatusId::new("gone"));
+        d.on_context_loaded(vec![], vec![r1, r1a, r1a1, r2, orphan]);
+        assert_eq!(d.depths, vec![1, 2, 3, 1, 1]);
+        // idx 0 = focal (no ancestors) → 0 cols; r1a (idx 2) → 2 cols;
+        // r1a1 (idx 3) → 4 cols.
+        assert_eq!(d.indent_for(0), 0);
+        assert_eq!(d.indent_for(1), 0);
+        assert_eq!(d.indent_for(2), 2);
+        assert_eq!(d.indent_for(3), 4);
+        assert_eq!(d.indent_for(5), 0);
     }
 
     #[test]

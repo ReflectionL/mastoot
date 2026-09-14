@@ -5,6 +5,8 @@
 pub mod app;
 pub mod images;
 pub mod screens;
+#[cfg(test)]
+mod snapshots;
 pub mod theme;
 pub mod widgets;
 

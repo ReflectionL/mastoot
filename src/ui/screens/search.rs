@@ -379,6 +379,7 @@ impl SearchScreen {
                         opts,
                         inner_width,
                         Some(&mut *music),
+                        None,
                     );
                     for ov in block.image_overlays {
                         overlays.push((start + ov.line_offset, ov));

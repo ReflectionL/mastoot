@@ -22,9 +22,9 @@ use ratatui::layout::Rect;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::{Resize, StatefulImage};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::{Notify, Semaphore, mpsc};
 use tracing::{debug, warn};
 
 use crate::api::models::MediaId;
@@ -39,9 +39,20 @@ const COMPLETION_CAP: usize = 64;
 /// pipeline is single-threaded per frame.
 const MAX_BYTES: usize = 6 * 1024 * 1024;
 
-/// Simple result type for a download — either bytes ready to decode,
-/// or a stringified error to log and forget.
-type Completion = (MediaId, Result<Vec<u8>, String>);
+/// Result of one fetch: a decoded image ready for the picker, or a
+/// stringified error to log and forget. Decoding happens on the
+/// blocking pool inside the download task, never on the render thread.
+type Completion = (MediaId, Result<image::DynamicImage, String>);
+
+/// Cap on simultaneous media downloads. A long timeline can reference
+/// dozens of previews at once; four in flight keeps the API happy and
+/// the first pictures appear sooner than with a thundering herd.
+const MAX_CONCURRENT_DOWNLOADS: usize = 4;
+
+fn download_gate() -> &'static Arc<Semaphore> {
+    static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    GATE.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS)))
+}
 
 pub struct ImageCache {
     picker: Option<Picker>,
@@ -185,40 +196,39 @@ impl ImageCache {
         let url = url.to_string();
         let tx = self.tx.clone();
         let notify = Arc::clone(&self.notify);
+        let gate = Arc::clone(download_gate());
         tokio::spawn(async move {
-            let res = download(&url).await;
+            let res = {
+                let _permit = gate.acquire().await;
+                match download(&url).await {
+                    Ok(bytes) => tokio::task::spawn_blocking(move || decode(&bytes))
+                        .await
+                        .unwrap_or_else(|e| Err(format!("decode task failed: {e}"))),
+                    Err(e) => Err(e),
+                }
+            };
             let _ = tx.send((id, res)).await;
             notify.notify_one();
         });
     }
 
-    /// Drain any completed downloads from the channel and decode them
-    /// into ratatui-image protocols ready for `render_stateful_widget`.
-    /// Decoding is CPU-bound and runs on the current task — keep an
-    /// eye on this if it ever shows up in profiles. For now it's
-    /// fine because each render tick processes ≤ a handful per drain.
+    /// Drain any completed downloads from the channel into ratatui-image
+    /// protocols ready for `render_stateful_widget`. Cheap: the pixels
+    /// were already decoded on the blocking pool.
     pub fn drain(&mut self) {
         // try_recv loop — non-blocking, drains everything available.
         while let Ok((id, res)) = self.rx.try_recv() {
             self.pending.remove(&id);
             match res {
-                Ok(bytes) => {
+                Ok(img) => {
                     let Some(picker) = self.picker.as_mut() else {
                         continue;
                     };
-                    match decode(&bytes) {
-                        Ok(img) => {
-                            let proto = picker.new_resize_protocol(img);
-                            self.cache.insert(id, proto);
-                        }
-                        Err(e) => {
-                            warn!(%id, ?e, "image decode failed");
-                            self.failed.insert(id);
-                        }
-                    }
+                    let proto = picker.new_resize_protocol(img);
+                    self.cache.insert(id, proto);
                 }
                 Err(e) => {
-                    warn!(%id, %e, "image download failed");
+                    warn!(%id, %e, "image fetch failed");
                     self.failed.insert(id);
                 }
             }
@@ -340,7 +350,7 @@ async fn download(url: &str) -> Result<Vec<u8>, String> {
     Ok(bytes.to_vec())
 }
 
-/// CPU-bound decode. Synchronous; called from `drain()` on the UI tick.
+/// CPU-bound decode. Runs on tokio's blocking pool.
 fn decode(bytes: &[u8]) -> Result<image::DynamicImage, String> {
     ImageReader::new(Cursor::new(bytes))
         .with_guessed_format()

@@ -116,11 +116,61 @@ pub struct CardOpts {
     pub spacious: bool,
 }
 
-/// Number of terminal rows reserved per inline image. Wide enough to
-/// look meaningful, short enough that 4-image grids still fit on a
-/// single screen. ratatui-image fits-to-area, so the actual aspect is
-/// preserved within this budget.
+/// Fallback rows for an inline image whose dimensions the server
+/// didn't report. When `meta.original` carries width / height the box
+/// is sized to the picture's aspect instead — see [`image_box`].
 pub const IMAGE_PLACEHOLDER_HEIGHT: u16 = 10;
+/// Tallest inline image; portrait pictures get narrowed to fit.
+const IMAGE_MAX_ROWS: u16 = 16;
+/// Shortest inline image; a panorama still gets a readable strip.
+const IMAGE_MIN_ROWS: u16 = 3;
+/// A terminal cell is roughly twice as tall as it is wide, so `w`
+/// columns × `h` rows show a `w : 2h` pixel box.
+const CELL_ASPECT: f64 = 2.0;
+
+/// `(rows, width_cols)` for an attachment rendered into a card of
+/// `avail_cols` columns, preserving the picture's aspect so
+/// ratatui-image's fit-to-area doesn't letterbox. Landscape images use
+/// the full width and as many rows as the aspect needs; portrait ones
+/// are capped at [`IMAGE_MAX_ROWS`] and narrowed instead.
+fn image_box(m: &MediaAttachment, avail_cols: u16) -> (u16, Option<u16>) {
+    let Some((w, h)) = media_dimensions(m) else {
+        return (IMAGE_PLACEHOLDER_HEIGHT, None);
+    };
+    if avail_cols == 0 {
+        return (IMAGE_PLACEHOLDER_HEIGHT, None);
+    }
+    let ratio = h / w; // pixel height per pixel width
+    let rows_full = (f64::from(avail_cols) * ratio / CELL_ASPECT).round();
+    if rows_full <= f64::from(IMAGE_MAX_ROWS) {
+        let rows = (rows_full as u16).clamp(IMAGE_MIN_ROWS, IMAGE_MAX_ROWS);
+        (rows, None)
+    } else {
+        let cols = (f64::from(IMAGE_MAX_ROWS) * CELL_ASPECT / ratio).round() as u16;
+        (IMAGE_MAX_ROWS, Some(cols.clamp(4, avail_cols)))
+    }
+}
+
+/// Pixel `(width, height)` from `meta.original` (or `meta.small`), if
+/// the server sent them.
+fn media_dimensions(m: &MediaAttachment) -> Option<(f64, f64)> {
+    let meta = m.meta.as_ref()?;
+    for key in ["original", "small"] {
+        let dims = &meta[key];
+        if let (Some(w), Some(h)) = (dims["width"].as_f64(), dims["height"].as_f64())
+            && w > 0.0
+            && h > 0.0
+        {
+            return Some((w, h));
+        }
+        if let Some(aspect) = dims["aspect"].as_f64()
+            && aspect > 0.0
+        {
+            return Some((aspect, 1.0));
+        }
+    }
+    None
+}
 
 /// One inline-image hint emitted by [`render_blocks`]. The caller is
 /// responsible for actually drawing the image on top of the placeholder
@@ -161,7 +211,28 @@ pub struct CardRender {
 /// [`render_blocks`] instead.
 #[must_use]
 pub fn render(status: &Status, theme: &Theme, opts: CardOpts, width: u16) -> Vec<Line<'static>> {
-    render_blocks(status, theme, opts, width, None).lines
+    render_blocks(status, theme, opts, width, None, None).lines
+}
+
+impl CardRender {
+    /// Shift the card right by `cols` (after the 2-column gutter) —
+    /// used for nested replies on the thread page. Image overlays
+    /// move with the text.
+    pub fn indent(&mut self, cols: u16) {
+        if cols == 0 {
+            return;
+        }
+        let pad = " ".repeat(cols as usize);
+        for line in &mut self.lines {
+            if line.spans.is_empty() {
+                continue;
+            }
+            line.spans.insert(1, Span::raw(pad.clone()));
+        }
+        for ov in &mut self.image_overlays {
+            ov.x_offset += cols;
+        }
+    }
 }
 
 /// Structured render: returns wrapped, gutter-aligned lines plus a
@@ -172,15 +243,20 @@ pub fn render(status: &Status, theme: &Theme, opts: CardOpts, width: u16) -> Vec
 /// enables link enrichment — compact inline rewrites in dense density
 /// mode, multi-line music cards with cover-art overlays in spacious
 /// mode. Passing `None` leaves the raw Mastodon HTML link untouched.
+///
+/// `parent` is the post this one replies to, when the caller has it
+/// on hand; with `opts.show_reply_hint` it turns the bare
+/// `↪ replying to @…` line into `↪ @…: "excerpt"`.
 pub fn render_blocks(
     status: &Status,
     theme: &Theme,
     opts: CardOpts,
     width: u16,
     mut music: Option<&mut crate::api::music::MusicCache>,
+    parent: Option<&Status>,
 ) -> CardRender {
     let wrap_w = width.saturating_sub(2); // gutter takes 2 columns
-    let (mut pre_lines, body_links) = build_lines(status, theme, opts);
+    let (mut pre_lines, body_links) = build_lines(status, theme, opts, parent);
 
     // Apple Music enrichment. Runs pre-wrap so the inline link
     // replacement lets the body flow naturally. In spacious density
@@ -278,18 +354,20 @@ pub fn render_blocks(
             {
                 let url = url.to_string();
                 let start = wrapped.len() as u16;
-                // Reserve placeholder rows; the screen overlays the
-                // actual image on top after the Paragraph renders.
-                for _ in 0..IMAGE_PLACEHOLDER_HEIGHT {
+                // Reserve placeholder rows sized to the picture; the
+                // screen overlays the actual image on top after the
+                // Paragraph renders.
+                let (rows, width_cols) = image_box(m, wrap_w);
+                for _ in 0..rows {
                     wrapped.push(Line::default());
                 }
                 image_overlays.push(ImageOverlay {
                     line_offset: start,
-                    height: IMAGE_PLACEHOLDER_HEIGHT,
+                    height: rows,
                     media_id: m.id.clone(),
                     url,
                     x_offset: 0,
-                    width_cols: None,
+                    width_cols,
                 });
                 // Alt-text caption below the image, dim italic. Hidden
                 // when the uploader didn't bother — most posts.
@@ -391,6 +469,7 @@ fn build_lines(
     status: &Status,
     theme: &Theme,
     opts: CardOpts,
+    parent: Option<&Status>,
 ) -> (Vec<Line<'static>>, Vec<html::LinkRef>) {
     let mut out: Vec<Line<'static>> = Vec::new();
 
@@ -458,17 +537,33 @@ fn build_lines(
     }
     out.push(Line::from(header));
 
-    // Reply hint. Cheap context that Phanpy / Ice Cubes both surface:
-    // who this post answers, resolved from the `mentions` list the
-    // server already sent (no extra fetch).
-    if opts.show_reply_hint
-        && shown.in_reply_to_id.is_some()
-        && let Some(hint) = reply_hint(shown)
-    {
-        out.push(Line::from(vec![
-            Span::styled("↪ ", theme.tertiary()),
-            Span::styled(hint, theme.tertiary()),
-        ]));
+    // Reply preview. With the parent on hand: `↪ @acct: "excerpt"`
+    // (CLAUDE.md §7.1). Otherwise a cheaper hint resolved from the
+    // `mentions` list the server already sent.
+    if opts.show_reply_hint && shown.in_reply_to_id.is_some() {
+        if let Some(p) = parent {
+            let excerpt = reply_excerpt(p, REPLY_EXCERPT_CHARS);
+            let mut spans = vec![
+                Span::styled("↪ ", theme.tertiary()),
+                Span::styled(
+                    emoji::normalize_owned(&format!("@{}", p.account.acct)),
+                    theme.secondary(),
+                ),
+            ];
+            if !excerpt.is_empty() {
+                spans.push(Span::styled(": ", theme.tertiary()));
+                spans.push(Span::styled(
+                    emoji::normalize_owned(&format!("\u{201c}{excerpt}\u{201d}")),
+                    theme.tertiary().add_modifier(Modifier::ITALIC),
+                ));
+            }
+            out.push(Line::from(spans));
+        } else if let Some(hint) = reply_hint(shown) {
+            out.push(Line::from(vec![
+                Span::styled("↪ ", theme.tertiary()),
+                Span::styled(hint, theme.tertiary()),
+            ]));
+        }
     }
 
     // Content-warning banner.
@@ -910,6 +1005,45 @@ fn format_time(ts: chrono::DateTime<Utc>, absolute: bool) -> String {
     }
 }
 
+/// Locate the post `status` (or its boosted inner post) replies to:
+/// first among `siblings` (the same list — threads often land on one
+/// page together), then in the app-level `parents` cache.
+#[must_use]
+pub fn find_parent<'a, S: std::hash::BuildHasher>(
+    status: &Status,
+    siblings: &'a [Status],
+    parents: &'a std::collections::HashMap<crate::api::models::StatusId, Status, S>,
+) -> Option<&'a Status> {
+    let shown = status.reblog.as_deref().unwrap_or(status);
+    let pid = shown.in_reply_to_id.as_ref()?;
+    siblings
+        .iter()
+        .map(|s| s.reblog.as_deref().unwrap_or(s))
+        .find(|s| s.id == *pid)
+        .or_else(|| parents.get(pid))
+}
+
+/// Characters of the parent's body shown in a reply preview.
+const REPLY_EXCERPT_CHARS: usize = 72;
+
+/// First `max` chars of the parent's plain text (CW text when the
+/// body is behind a warning), collapsed to one line.
+fn reply_excerpt(p: &Status, max: usize) -> String {
+    let source = if p.spoiler_text.is_empty() {
+        html::to_plain_text(&p.content)
+    } else {
+        format!("CW: {}", p.spoiler_text)
+    };
+    let one_line: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+    let mut it = one_line.chars();
+    let head: String = it.by_ref().take(max).collect();
+    if it.next().is_some() {
+        format!("{}…", head.trim_end())
+    } else {
+        head
+    }
+}
+
 /// `replying to @acct`, `in a thread` (self-reply), or `reply` when the
 /// server didn't tell us who. `None` only when the status isn't a
 /// reply at all.
@@ -1334,6 +1468,38 @@ mod tests {
     }
 
     #[test]
+    fn reply_preview_quotes_the_parent_when_known() {
+        let theme = Theme::frost();
+        let mut parent = fake_status("0", "<p>What about the <b>other</b> thing?</p>");
+        parent.account.acct = "bob@ex.com".into();
+        let mut s = fake_status("1", "<p>yes</p>");
+        s.in_reply_to_id = Some(StatusId::new("0"));
+        let opts = CardOpts {
+            show_reply_hint: true,
+            ..opts_plain()
+        };
+        let text: String = render_blocks(&s, &theme, opts, 80, None, Some(&parent))
+            .lines
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|sp| sp.content.as_ref()))
+            .collect();
+        assert!(
+            text.contains("↪ @bob@ex.com: \u{201c}What about the other thing?\u{201d}"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn indent_shifts_text_and_overlays() {
+        let theme = Theme::frost();
+        let s = fake_status("1", "<p>nested</p>");
+        let mut block = render_blocks(&s, &theme, opts_plain(), 40, None, None);
+        block.indent(4);
+        let first = &block.lines[0];
+        assert_eq!(first.spans[1].content.as_ref(), "    ");
+    }
+
+    #[test]
     fn poll_renders_bars_and_footer() {
         use crate::api::models::{Poll, PollId, PollOption};
         let theme = Theme::frost();
@@ -1423,6 +1589,33 @@ mod tests {
             .collect();
         assert!(dimmed.iter().any(|t| t == ":blobcat:"), "{dimmed:?}");
         assert!(dimmed.iter().any(|t| t == ":verified:"), "{dimmed:?}");
+    }
+
+    #[test]
+    fn image_box_follows_aspect_ratio() {
+        use crate::api::models::{MediaAttachment, MediaId, MediaType};
+        let mk = |w: u64, h: u64| MediaAttachment {
+            id: MediaId::new("m"),
+            media_type: MediaType::Image,
+            url: None,
+            preview_url: None,
+            remote_url: None,
+            description: None,
+            blurhash: None,
+            meta: Some(serde_json::json!({"original": {"width": w, "height": h}})),
+            preview_remote_url: None,
+            text_url: None,
+        };
+        // 2:1 panorama in 40 cols → 40 * 0.5 / 2 = 10 rows, full width.
+        assert_eq!(image_box(&mk(2000, 1000), 40), (10, None));
+        // Square in 40 cols → 20 rows > cap → 16 rows, narrowed to 32 cols.
+        assert_eq!(image_box(&mk(1000, 1000), 40), (16, Some(32)));
+        // Extreme panorama still gets the minimum strip.
+        assert_eq!(image_box(&mk(4000, 200), 40), (IMAGE_MIN_ROWS, None));
+        // No meta → legacy fallback.
+        let mut m = mk(1, 1);
+        m.meta = None;
+        assert_eq!(image_box(&m, 40), (IMAGE_PLACEHOLDER_HEIGHT, None));
     }
 
     #[test]

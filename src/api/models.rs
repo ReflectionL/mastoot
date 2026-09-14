@@ -556,6 +556,21 @@ pub struct Relationship {
 }
 
 // ---------------------------------------------------------------------------
+// Status source (for editing)
+// ---------------------------------------------------------------------------
+
+/// `GET /api/v1/statuses/:id/source` — the author's original plain
+/// text, as opposed to the rendered HTML in [`Status::content`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct StatusSource {
+    pub id: StatusId,
+    #[serde(default)]
+    pub text: String,
+    #[serde(default)]
+    pub spoiler_text: String,
+}
+
+// ---------------------------------------------------------------------------
 // Search result
 // ---------------------------------------------------------------------------
 

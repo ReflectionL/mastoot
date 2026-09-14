@@ -2,7 +2,7 @@
 //! cards top-down into a scrollable viewport, and maps vim-ish keys
 //! (`j` / `k` / `gg` / `G` / `R`) to [`Action`]s.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -201,6 +201,7 @@ impl TimelineScreen {
         items: &[Status],
         theme: &Theme,
         prefs: RenderPrefs,
+        parents: &HashMap<StatusId, Status>,
         music: &mut MusicCache,
         images_cache: &mut ImageCache,
     ) {
@@ -233,8 +234,15 @@ impl TimelineScreen {
                 show_reply_hint: true,
                 ..prefs.card_opts()
             };
-            let block =
-                status_card::render_blocks(status, theme, opts, inner_width, Some(&mut *music));
+            let parent = status_card::find_parent(status, items, parents);
+            let block = status_card::render_blocks(
+                status,
+                theme,
+                opts,
+                inner_width,
+                Some(&mut *music),
+                parent,
+            );
             let start = lines.len() as u16;
             let len = block.lines.len() as u16;
             for ov in block.image_overlays {

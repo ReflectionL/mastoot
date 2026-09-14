@@ -10,7 +10,7 @@ use crate::api::client::MastodonClient;
 use crate::api::error::ApiResult;
 use crate::api::models::{
     Account, AccountId, Context, Instance, MediaAttachment, MediaId, Notification, NotificationId,
-    Relationship, SearchResults, Status, StatusId, Visibility,
+    Relationship, SearchResults, Status, StatusId, StatusSource, Visibility,
 };
 use crate::api::pagination::Page;
 
@@ -237,6 +237,12 @@ impl MastodonClient {
         self.get(&format!("/api/v1/statuses/{id}"), &[]).await
     }
 
+    /// GET /api/v1/statuses/{id}/source — original text for editing.
+    pub async fn status_source(&self, id: &StatusId) -> ApiResult<StatusSource> {
+        self.get(&format!("/api/v1/statuses/{id}/source"), &[])
+            .await
+    }
+
     /// GET /api/v1/statuses/{id}/context
     pub async fn status_context(&self, id: &StatusId) -> ApiResult<Context> {
         self.get(&format!("/api/v1/statuses/{id}/context"), &[])
@@ -454,14 +460,18 @@ impl MastodonClient {
 // ---------------------------------------------------------------------------
 
 impl MastodonClient {
-    /// GET /api/v1/favourites
-    pub async fn favourites(&self) -> ApiResult<Page<Vec<Status>>> {
-        self.get_page("/api/v1/favourites", &[]).await
+    /// GET /api/v1/favourites. Paginates through the `Link` header:
+    /// the `max_id` there is an internal favourite id, not a status
+    /// id, so always feed back [`Page::next`] rather than a status id.
+    pub async fn favourites(&self, params: &AccountListParams) -> ApiResult<Page<Vec<Status>>> {
+        self.get_page("/api/v1/favourites", &params.to_query())
+            .await
     }
 
-    /// GET /api/v1/bookmarks
-    pub async fn bookmarks(&self) -> ApiResult<Page<Vec<Status>>> {
-        self.get_page("/api/v1/bookmarks", &[]).await
+    /// GET /api/v1/bookmarks. Same `Link`-header pagination caveat as
+    /// [`Self::favourites`].
+    pub async fn bookmarks(&self, params: &AccountListParams) -> ApiResult<Page<Vec<Status>>> {
+        self.get_page("/api/v1/bookmarks", &params.to_query()).await
     }
 }
 
