@@ -20,6 +20,7 @@ use crate::api::models::{Notification, NotificationType, Status};
 use crate::state::{Action, TimelineKind};
 use crate::ui::Theme;
 use crate::ui::widgets::notification_card;
+use crate::ui::widgets::status_card::RenderPrefs;
 
 const LOAD_MORE_TRIGGER: usize = 5;
 
@@ -98,6 +99,8 @@ pub struct NotificationsScreen {
     pub filter: NotificationFilter,
     last_g: bool,
     pub load_more_pending: bool,
+    known_len: usize,
+    pub exhausted: bool,
 }
 
 impl Default for NotificationsScreen {
@@ -115,6 +118,8 @@ impl NotificationsScreen {
             filter: NotificationFilter::All,
             last_g: false,
             load_more_pending: false,
+            known_len: 0,
+            exhausted: false,
         }
     }
 
@@ -125,6 +130,18 @@ impl NotificationsScreen {
         self.filter = NotificationFilter::All;
         self.last_g = false;
         self.load_more_pending = false;
+        self.known_len = 0;
+        self.exhausted = false;
+    }
+
+    /// A `LoadMore` request errored out — allow a retry.
+    pub fn on_load_more_failed(&mut self) {
+        self.load_more_pending = false;
+    }
+
+    /// The list changed outside a page load (deletion).
+    pub fn on_len_changed(&mut self, len: usize) {
+        self.known_len = len;
     }
 
     /// Indexes (into the full `notifications` list) that pass the
@@ -139,10 +156,16 @@ impl NotificationsScreen {
     }
 
     pub fn on_items_changed(&mut self, len: usize, appended: bool) {
-        if !appended {
+        if appended {
+            if len == self.known_len {
+                self.exhausted = true;
+            }
+        } else {
             self.selected = 0;
             self.scroll = 0;
+            self.exhausted = false;
         }
+        self.known_len = len;
         if self.selected >= len && len > 0 {
             self.selected = len - 1;
         }
@@ -158,6 +181,14 @@ impl NotificationsScreen {
         }
         let bumped = self.selected.saturating_add(count);
         self.selected = bumped.min(new_len - 1);
+        self.known_len = new_len;
+    }
+
+    /// Index into the full list of the currently selected *visible*
+    /// notification, if any.
+    #[must_use]
+    pub fn selected_index(&self, items: &[Notification]) -> Option<usize> {
+        self.visible_indices(items).get(self.selected).copied()
     }
 
     /// Driver. `items` is the full notifications list.
@@ -236,6 +267,7 @@ impl NotificationsScreen {
         visible_len: usize,
     ) -> NotifOutcome {
         if !self.load_more_pending
+            && !self.exhausted
             && total_len > 0
             && visible_len > 0
             && selected + LOAD_MORE_TRIGGER >= visible_len
@@ -290,7 +322,7 @@ impl NotificationsScreen {
         area: Rect,
         items: &[Notification],
         theme: &Theme,
-        nerd_font: bool,
+        prefs: RenderPrefs,
     ) {
         let layout = Layout::default()
             .direction(Direction::Vertical)
@@ -329,7 +361,7 @@ impl NotificationsScreen {
                 &items[*idx],
                 theme,
                 i == self.selected,
-                nerd_font,
+                prefs,
                 inner_width,
             );
             let start = lines.len() as u16;
@@ -340,7 +372,8 @@ impl NotificationsScreen {
             }
         }
 
-        let height = body_area.height;
+        // Minus the Block's one-row top padding.
+        let height = body_area.height.saturating_sub(1);
         let (sel_start, sel_end) = sel_range;
         if sel_start < self.scroll {
             self.scroll = sel_start;

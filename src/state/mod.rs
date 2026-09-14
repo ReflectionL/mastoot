@@ -6,7 +6,7 @@ pub mod event;
 pub mod task;
 pub mod timeline;
 
-pub use app::AppState;
+pub use app::{AppState, Shared};
 pub use event::{Action, ApiHealth, Event, StreamMode, StreamState, ToastLevel, Visibility};
 pub use task::{Handle, spawn};
-pub use timeline::{TimelineKind, TimelineStore};
+pub use timeline::TimelineKind;

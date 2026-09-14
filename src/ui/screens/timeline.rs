@@ -16,7 +16,7 @@ use crate::api::music::MusicCache;
 use crate::state::{Action, TimelineKind};
 use crate::ui::Theme;
 use crate::ui::images::{self, ImageCache};
-use crate::ui::widgets::status_card::{self, CardOpts, ImageOverlay};
+use crate::ui::widgets::status_card::{self, ImageOverlay, RenderPrefs};
 
 /// Threshold at which we auto-request more posts. When the cursor is
 /// within this many items of the end we fire [`Action::LoadMore`].
@@ -29,6 +29,13 @@ pub struct TimelineScreen {
     pub scroll: u16,
     pub last_g: bool,
     pub load_more_pending: bool,
+    /// Length of the backing list as of the last update we were told
+    /// about. Lets `on_items_changed` detect an empty "older" page.
+    known_len: usize,
+    /// The server returned nothing older — stop asking until the next
+    /// full refresh. Without this, every `j` at the bottom of a
+    /// finished timeline re-fires `LoadMore`.
+    pub exhausted: bool,
     /// Status ids whose CW the user has explicitly revealed in this
     /// session. Lives per-tab on purpose: revealing a CW in Home does
     /// not reveal it in Federated. Resets on tab refresh.
@@ -44,6 +51,8 @@ impl TimelineScreen {
             scroll: 0,
             last_g: false,
             load_more_pending: false,
+            known_len: 0,
+            exhausted: false,
             revealed: HashSet::new(),
         }
     }
@@ -56,17 +65,41 @@ impl TimelineScreen {
         self.scroll = 0;
         self.last_g = false;
         self.load_more_pending = false;
+        self.known_len = 0;
+        self.exhausted = false;
         self.revealed.clear();
     }
 
     pub fn on_items_changed(&mut self, len: usize, appended: bool) {
-        if !appended {
+        if appended {
+            if len == self.known_len {
+                self.exhausted = true;
+            }
+        } else {
             self.selected = 0;
             self.scroll = 0;
+            self.exhausted = false;
         }
+        self.known_len = len;
         if self.selected >= len && len > 0 {
             self.selected = len - 1;
         }
+        self.load_more_pending = false;
+    }
+
+    /// The backing list shrank or grew outside of a page load (a
+    /// deletion, a stream prepend). Keeps the exhaustion heuristic
+    /// honest and clamps the cursor.
+    pub fn on_len_changed(&mut self, len: usize) {
+        self.known_len = len;
+        if self.selected >= len && len > 0 {
+            self.selected = len - 1;
+        }
+    }
+
+    /// A `LoadMore` request errored out — allow the next scroll to
+    /// the bottom to try again.
+    pub fn on_load_more_failed(&mut self) {
         self.load_more_pending = false;
     }
 
@@ -84,6 +117,7 @@ impl TimelineScreen {
         // bumped index.
         let bumped = self.selected.saturating_add(count);
         self.selected = bumped.min(new_len - 1);
+        self.known_len = new_len;
     }
 
     /// Translate a key into an optional [`Action`]. `items` is the
@@ -139,7 +173,11 @@ impl TimelineScreen {
     }
 
     fn check_load_more(&mut self, len: usize) -> Option<Action> {
-        if !self.load_more_pending && len > 0 && self.selected + LOAD_MORE_TRIGGER >= len {
+        if !self.load_more_pending
+            && !self.exhausted
+            && len > 0
+            && self.selected + LOAD_MORE_TRIGGER >= len
+        {
             self.load_more_pending = true;
             Some(Action::LoadMore(self.kind))
         } else {
@@ -162,7 +200,7 @@ impl TimelineScreen {
         area: Rect,
         items: &[Status],
         theme: &Theme,
-        nerd_font: bool,
+        prefs: RenderPrefs,
         music: &mut MusicCache,
         images_cache: &mut ImageCache,
     ) {
@@ -183,17 +221,17 @@ impl TimelineScreen {
         let mut image_overlays: Vec<(u16, ImageOverlay)> = Vec::new();
         for (i, status) in items.iter().enumerate() {
             if i > 0 {
-                for _ in 0..status_card::inter_post_blank_lines() {
+                for _ in 0..prefs.inter_post_blank_lines {
                     lines.push(Line::default());
                 }
             }
             let inner_id = &status.reblog.as_deref().unwrap_or(status).id;
-            let opts = CardOpts {
+            let opts = status_card::CardOpts {
                 selected: i == self.selected,
-                nerd_font,
-                show_metrics: false,
                 cw_revealed: self.revealed.contains(inner_id),
                 show_images: images_cache.enabled(),
+                show_reply_hint: true,
+                ..prefs.card_opts()
             };
             let block =
                 status_card::render_blocks(status, theme, opts, inner_width, Some(&mut *music));
@@ -209,7 +247,9 @@ impl TimelineScreen {
         }
 
         // Keep the selected card inside `area` by adjusting scroll.
-        let height = area.height;
+        // The Block below pads one row at the top, so the visible
+        // window is one shorter than `area.height`.
+        let height = area.height.saturating_sub(1);
         let (sel_start, sel_end) = selected_line_range;
         if sel_start < self.scroll {
             self.scroll = sel_start;
@@ -319,6 +359,37 @@ mod tests {
         let items20 = fake_items(20);
         let third = s.handle_key(key('j'), &items20);
         assert!(third.is_none()); // cursor at 7, threshold 5 → 12 < 20, no fire
+    }
+
+    #[test]
+    fn empty_older_page_marks_exhausted_until_refresh() {
+        let mut s = TimelineScreen::new(TimelineKind::Home);
+        s.on_items_changed(10, false);
+        s.selected = 8;
+        let items = fake_items(10);
+        assert!(matches!(
+            s.handle_key(key('j'), &items),
+            Some(Action::LoadMore(_))
+        ));
+        // Server says: nothing older.
+        s.on_items_changed(10, true);
+        assert!(s.exhausted);
+        assert!(s.handle_key(key('j'), &items).is_none());
+        // A refresh clears the flag.
+        s.on_items_changed(10, false);
+        assert!(!s.exhausted);
+    }
+
+    #[test]
+    fn load_more_failure_unwedges_pagination() {
+        let mut s = TimelineScreen::new(TimelineKind::Home);
+        s.on_items_changed(10, false);
+        s.selected = 8;
+        let items = fake_items(10);
+        assert!(s.handle_key(key('j'), &items).is_some());
+        assert!(s.handle_key(key('j'), &items).is_none());
+        s.on_load_more_failed();
+        assert!(s.handle_key(key('j'), &items).is_some());
     }
 
     #[test]

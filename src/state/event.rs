@@ -4,7 +4,9 @@ use secrecy::SecretString;
 use serde::{Deserialize, Serialize};
 
 use crate::api::ApiErrorCategory;
-use crate::api::models::{Account, AccountId, Notification, Relationship, Status, StatusId};
+use crate::api::models::{
+    Account, AccountId, Notification, Relationship, SearchResults, Status, StatusId,
+};
 use crate::state::TimelineKind;
 
 /// Intent from the UI layer. Never carries ratatui types.
@@ -79,6 +81,15 @@ pub enum Action {
         handle: String,
         token: SecretString,
     },
+    /// `/api/v2/search` for `query` (accounts + hashtags + statuses).
+    Search {
+        query: String,
+    },
+    /// Hashtag timeline for `name` (without the `#`). Delivered as a
+    /// [`Event::SearchStatuses`] so the search screen can show it.
+    SearchTag {
+        name: String,
+    },
     /// Polling tick — fetch any statuses newer than what we already
     /// have in `kind` and prepend them. Fired by the internal polling
     /// loop; not meant for UI to emit directly.
@@ -96,6 +107,10 @@ pub enum Event {
         statuses: Vec<Status>,
         appended: bool,
     },
+    /// A `LoadMore` (older page) request for `kind` failed. The UI
+    /// clears its "request in flight" flag so the next scroll to the
+    /// bottom can retry, instead of wedging forever.
+    LoadMoreFailed(TimelineKind),
     /// A single fresh status arrived from the SSE user stream. UI
     /// prepends it to the relevant timeline (deduped by id) and nudges
     /// the selection so the cursor keeps tracking its previous target.
@@ -133,6 +148,10 @@ pub enum Event {
         statuses: Vec<Status>,
         appended: bool,
     },
+    /// [`Action::LoadProfile`] for this account failed (either the
+    /// header fetch or the statuses page). Lets the profile screen
+    /// leave its loading state / unwedge pagination.
+    ProfileLoadFailed(AccountId),
     /// Result of [`Action::LoadRelationship`] *or* a successful
     /// follow / unfollow round-trip (both API endpoints return the
     /// updated relationship). Matched against the open profile by id.
@@ -152,6 +171,11 @@ pub enum Event {
         accounts: Vec<Account>,
         appended: bool,
     },
+    /// [`Action::LoadAccountList`] failed for `(for_id, kind)`.
+    AccountListLoadFailed {
+        for_id: AccountId,
+        kind: AccountListKind,
+    },
     /// A status-level action (`favourite`, `reblog`, …) that the UI
     /// applied optimistically failed server-side. The UI should reverse
     /// the local state change.
@@ -160,6 +184,22 @@ pub enum Event {
         action: FailedAction,
     },
     NotificationReceived(Notification),
+    /// Result of [`Action::Search`]. `query` is echoed so a stale
+    /// reply can't overwrite a newer search.
+    SearchResults {
+        query: String,
+        results: SearchResults,
+    },
+    /// Result of [`Action::SearchTag`]: a page of statuses shown under
+    /// the `#name` query.
+    SearchStatuses {
+        query: String,
+        statuses: Vec<Status>,
+    },
+    /// Either search request failed for `query`.
+    SearchFailed {
+        query: String,
+    },
     /// A one-shot human-readable toast.
     Toast {
         level: ToastLevel,

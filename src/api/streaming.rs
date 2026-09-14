@@ -24,8 +24,8 @@
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use futures::StreamExt;
 use futures::stream::Stream;
-use futures_util::StreamExt;
 use reqwest_eventsource::{Event, EventSource};
 use secrecy::ExposeSecret;
 use tracing::{debug, warn};
@@ -86,15 +86,18 @@ impl UserStream {
             .token()
             .ok_or_else(|| ApiError::OAuth("streaming requires a user token".into()))?;
         let url = client.base_url().join(path)?;
-        let http = reqwest::Client::builder()
-            .user_agent(crate::api::client::USER_AGENT)
-            .build()?;
-        let request = http
+        let request = crate::api::client::shared_stream_http()
             .get(url)
             .bearer_auth(token.expose_secret())
             .header(reqwest::header::ACCEPT, "text/event-stream");
-        let source = EventSource::new(request)
+        let mut source = EventSource::new(request)
             .map_err(|e| ApiError::Stream(format!("failed to open stream: {e}")))?;
+        // Reconnect policy lives in `state::task::streaming_loop` (with
+        // its own backoff + UI status broadcast). Leaving the library's
+        // default `ExponentialBackoff` on would stack a second, silent
+        // retry layer underneath it — the UI would show "Connected"
+        // while the library was quietly redialing.
+        source.set_retry_policy(Box::new(reqwest_eventsource::retry::Never));
         Ok(Self {
             inner: source,
             done: false,

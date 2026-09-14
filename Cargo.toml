@@ -2,7 +2,7 @@
 name = "mastoot"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 description = "An aesthetically-driven Mastodon TUI client"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
@@ -19,7 +19,6 @@ path = "src/main.rs"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 futures = "0.3"
-futures-util = "0.3"
 
 # HTTP (rustls only, no openssl)
 reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "multipart", "rustls-tls", "gzip", "brotli", "http2"] }
@@ -45,19 +44,19 @@ tracing-appender = "0.2"
 
 # CLI / Config / Paths
 clap = { version = "4", features = ["derive"] }
-toml = "0.8"
-directories = "5"
+toml = "1"
+directories = "6"
 
 # Auth storage
 keyring = { version = "3", features = ["apple-native", "sync-secret-service", "windows-native"] }
 secrecy = { version = "0.10", features = ["serde"] }
 
 # HTML parsing
-scraper = "0.21"
-ego-tree = "0.9"
+scraper = "0.27"
+ego-tree = "0.11"
 
 # Random / crypto for OAuth PKCE + state
-rand = "0.8"
+rand = "0.10"
 sha2 = "0.10"
 base64 = "0.22"
 
@@ -69,6 +68,8 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 
 # Utilities
 unicode-width = "0.2"
+unicode-segmentation = "1.13"
+unicode-properties = { version = "0.1", default-features = false, features = ["emoji"] }
 open = "5"
 percent-encoding = "2"
 

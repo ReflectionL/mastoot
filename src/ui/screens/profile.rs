@@ -22,7 +22,8 @@ use crate::api::music::MusicCache;
 use crate::state::Action;
 use crate::ui::Theme;
 use crate::ui::images::{self, ImageCache};
-use crate::ui::widgets::status_card::{self, CardOpts, ImageOverlay};
+use crate::ui::widgets::status_card::{self, ImageOverlay, RenderPrefs};
+use crate::util::emoji;
 
 const LOAD_MORE_TRIGGER: usize = 5;
 
@@ -47,6 +48,8 @@ pub struct ProfileScreen {
     last_g: bool,
     pub load_more_pending: bool,
     pub loading: bool,
+    /// No older statuses left — stop paginating until refresh.
+    pub exhausted: bool,
     /// Viewer ↔ this-account relationship. `None` until
     /// [`Action::LoadRelationship`] returns; `Some` once known.
     /// Always `None` for self-profile (we never fetch our own).
@@ -69,7 +72,25 @@ impl ProfileScreen {
             last_g: false,
             load_more_pending: false,
             loading: true,
+            exhausted: false,
             relationship: None,
+        }
+    }
+
+    /// The fetch behind this screen failed. Leave whatever is on
+    /// screen alone but drop the loading / pending flags so the user
+    /// can retry with `R` or by scrolling.
+    pub fn on_load_failed(&mut self) {
+        self.loading = false;
+        self.load_more_pending = false;
+    }
+
+    /// Drop a deleted status from the list, clamping the cursor.
+    pub fn on_status_deleted(&mut self, id: &crate::api::models::StatusId) {
+        self.statuses
+            .retain(|s| s.id != *id && s.reblog.as_ref().is_none_or(|r| r.id != *id));
+        if self.selected >= self.statuses.len() && !self.statuses.is_empty() {
+            self.selected = self.statuses.len() - 1;
         }
     }
 
@@ -115,6 +136,7 @@ impl ProfileScreen {
         // Pagination calls don't carry a real account — only the id.
         // Don't overwrite the cached header with a stub.
         if appended {
+            let before = self.statuses.len();
             let known: std::collections::HashSet<_> =
                 self.statuses.iter().map(|s| s.id.clone()).collect();
             for s in statuses {
@@ -122,11 +144,15 @@ impl ProfileScreen {
                     self.statuses.push(s);
                 }
             }
+            if self.statuses.len() == before {
+                self.exhausted = true;
+            }
         } else {
             self.account = Some(account);
             self.statuses = statuses;
             self.selected = 0;
             self.scroll = 0;
+            self.exhausted = false;
         }
         self.loading = false;
         self.load_more_pending = false;
@@ -292,7 +318,11 @@ impl ProfileScreen {
     }
 
     fn check_load_more(&mut self, len: usize) -> ProfileOutcome {
-        if !self.load_more_pending && len > 0 && self.selected + LOAD_MORE_TRIGGER >= len {
+        if !self.load_more_pending
+            && !self.exhausted
+            && len > 0
+            && self.selected + LOAD_MORE_TRIGGER >= len
+        {
             self.load_more_pending = true;
             let max_id = self.statuses.last().map(|s| s.id.0.clone());
             ProfileOutcome::Dispatch(Action::LoadProfile {
@@ -316,12 +346,12 @@ impl ProfileScreen {
             return out;
         };
 
-        let display = if acc.display_name.is_empty() {
+        let display = emoji::normalize_owned(&if acc.display_name.is_empty() {
             acc.username.clone()
         } else {
             acc.display_name.clone()
-        };
-        let handle = format!("@{}", acc.acct);
+        });
+        let handle = emoji::normalize_owned(&format!("@{}", acc.acct));
         let mut header = vec![
             Span::styled(display, theme.display_name()),
             Span::raw("  "),
@@ -352,7 +382,10 @@ impl ProfileScreen {
                 header.push(Span::styled(label.to_string(), theme.secondary()));
             }
         }
-        out.push(Line::from(header));
+        let mut header_lines = vec![Line::from(header)];
+        let codes: Vec<&str> = acc.emojis.iter().map(|e| e.shortcode.as_str()).collect();
+        crate::ui::widgets::shortcode::dim_shortcodes(&mut header_lines, &codes, theme.tertiary());
+        out.extend(header_lines);
 
         // Counts: posts · followers · following.
         let counts = format!(
@@ -364,7 +397,8 @@ impl ProfileScreen {
         // Bio. HTML-rendered, dimmed, wrapped to inner_width.
         if !acc.note.is_empty() {
             out.push(Line::default());
-            let bio = html::render(&acc.note, theme);
+            let mut bio = html::render(&acc.note, theme);
+            crate::ui::widgets::shortcode::dim_shortcodes(&mut bio, &codes, theme.tertiary());
             let mut wrapped = crate::ui::widgets::wrap::wrap_lines(&bio, inner_width);
             for line in &mut wrapped {
                 for span in &mut line.spans {
@@ -384,7 +418,7 @@ impl ProfileScreen {
         frame: &mut Frame<'_>,
         area: Rect,
         theme: &Theme,
-        nerd_font: bool,
+        prefs: RenderPrefs,
         music: &mut MusicCache,
         images_cache: &mut ImageCache,
     ) {
@@ -410,16 +444,15 @@ impl ProfileScreen {
         let mut image_overlays: Vec<(u16, ImageOverlay)> = Vec::new();
         for (i, status) in self.statuses.iter().enumerate() {
             if i > 0 {
-                for _ in 0..status_card::inter_post_blank_lines() {
+                for _ in 0..prefs.inter_post_blank_lines {
                     lines.push(Line::default());
                 }
             }
-            let opts = CardOpts {
+            let opts = status_card::CardOpts {
                 selected: i == self.selected,
-                nerd_font,
-                show_metrics: false,
-                cw_revealed: false,
                 show_images: images_cache.enabled(),
+                show_reply_hint: true,
+                ..prefs.card_opts()
             };
             let block =
                 status_card::render_blocks(status, theme, opts, inner_width, Some(&mut *music));
@@ -434,7 +467,8 @@ impl ProfileScreen {
             }
         }
 
-        let height = area.height;
+        // Minus the Block's one-row top padding.
+        let height = area.height.saturating_sub(1);
         let (sel_start, sel_end) = sel_range;
         if !self.statuses.is_empty() {
             if sel_start < self.scroll {

@@ -19,7 +19,9 @@ use crate::api::html;
 use crate::api::models::{Notification, NotificationType};
 use crate::icons;
 use crate::ui::Theme;
+use crate::ui::widgets::status_card::RenderPrefs;
 use crate::ui::widgets::wrap;
+use crate::util::emoji;
 use crate::util::time::relative;
 
 /// Render a notification as already-wrapped visual lines, including
@@ -29,10 +31,10 @@ pub fn render(
     n: &Notification,
     theme: &Theme,
     selected: bool,
-    nerd_font: bool,
+    prefs: RenderPrefs,
     width: u16,
 ) -> Vec<Line<'static>> {
-    let body = build_lines(n, theme, nerd_font, width.saturating_sub(2));
+    let body = build_lines(n, theme, prefs, width.saturating_sub(2));
     body.into_iter()
         .map(|l| with_gutter(l, theme, selected))
         .collect()
@@ -41,20 +43,28 @@ pub fn render(
 fn build_lines(
     n: &Notification,
     theme: &Theme,
-    nerd_font: bool,
+    prefs: RenderPrefs,
     inner_width: u16,
 ) -> Vec<Line<'static>> {
+    let nerd_font = prefs.nerd_font;
+    let absolute_time = prefs.absolute_time;
     let mut out: Vec<Line<'static>> = Vec::new();
 
-    let display = if n.account.display_name.is_empty() {
+    let display = emoji::normalize_owned(&if n.account.display_name.is_empty() {
         n.account.username.clone()
     } else {
         n.account.display_name.clone()
-    };
-    let handle = format!("@{}", n.account.acct);
+    });
+    let handle = emoji::normalize_owned(&format!("@{}", n.account.acct));
     let time = n
         .created_at
-        .map(|ts| relative(Utc::now(), ts))
+        .map(|ts| {
+            if absolute_time {
+                crate::util::time::absolute(Utc::now(), ts)
+            } else {
+                relative(Utc::now(), ts)
+            }
+        })
         .unwrap_or_default();
 
     let (icon, verb, icon_style) = describe(n.notification_type, nerd_font, theme);
@@ -71,16 +81,36 @@ fn build_lines(
         spans.push(Span::styled("  ·  ", theme.timestamp()));
         spans.push(Span::styled(time, theme.timestamp()));
     }
-    out.push(Line::from(spans));
+    let mut header = vec![Line::from(spans)];
+    let name_codes: Vec<&str> = n
+        .account
+        .emojis
+        .iter()
+        .map(|e| e.shortcode.as_str())
+        .collect();
+    crate::ui::widgets::shortcode::dim_shortcodes(&mut header, &name_codes, theme.tertiary());
+    out.extend(header);
 
-    // Optional status excerpt (first ~3 wrapped lines, dim).
+    // Optional status excerpt (first ~3 wrapped, non-blank lines, dim).
     if let Some(status) = n.status.as_ref() {
-        let body = html::render(&status.content, theme);
+        let mut body = html::render(&status.content, theme);
+        let codes: Vec<&str> = status
+            .emojis
+            .iter()
+            .chain(status.account.emojis.iter())
+            .map(|e| e.shortcode.as_str())
+            .collect();
+        crate::ui::widgets::shortcode::dim_shortcodes(&mut body, &codes, theme.tertiary());
         // Re-flow at inner_width minus a 2-col indent so the excerpt
-        // visibly nests under the action line.
+        // visibly nests under the action line. Paragraph gaps are
+        // dropped — an excerpt is a peek, not the layout.
         let excerpt_w = inner_width.saturating_sub(2);
         let wrapped = wrap::wrap_lines(&body, excerpt_w);
-        for (i, mut line) in wrapped.into_iter().enumerate() {
+        for (i, mut line) in wrapped
+            .into_iter()
+            .filter(|l| !l.spans.is_empty())
+            .enumerate()
+        {
             if i >= EXCERPT_MAX_LINES {
                 let truncated_marker = Line::from(Span::styled("  …", theme.tertiary()));
                 out.push(truncated_marker);
@@ -231,7 +261,7 @@ mod tests {
     fn favourite_renders_action_text() {
         let theme = Theme::frost();
         let n = fake_notif(NotificationType::Favourite);
-        let lines = render(&n, &theme, false, true, 80);
+        let lines = render(&n, &theme, false, RenderPrefs::default(), 80);
         let text = join(&lines);
         assert!(text.contains("favourited your post"));
         assert!(text.contains("@alice@ex.com"));
@@ -241,7 +271,7 @@ mod tests {
     fn follow_has_no_status_excerpt() {
         let theme = Theme::frost();
         let n = fake_notif(NotificationType::Follow);
-        let lines = render(&n, &theme, false, true, 80);
+        let lines = render(&n, &theme, false, RenderPrefs::default(), 80);
         assert_eq!(lines.len(), 1, "follow should emit just the action line");
     }
 
@@ -257,7 +287,7 @@ mod tests {
             content: format!("<p>{body}</p>"),
             ..Default::default()
         });
-        let lines = render(&n, &theme, false, true, 40);
+        let lines = render(&n, &theme, false, RenderPrefs::default(), 40);
         // 1 action + ≤ EXCERPT_MAX_LINES + at most 1 ellipsis line.
         assert!(lines.len() <= 1 + EXCERPT_MAX_LINES + 1);
         assert!(join(&lines).contains('…'));
@@ -269,7 +299,7 @@ mod tests {
         use unicode_width::UnicodeWidthChar;
         let theme = Theme::frost();
         let n = fake_notif(NotificationType::Favourite);
-        let lines = render(&n, &theme, true, true, 80);
+        let lines = render(&n, &theme, true, RenderPrefs::default(), 80);
         let first = lines.first().unwrap();
         // Gutter is two columns: cursor glyph (▏ = 1 col) + space.
         let prefix: String = first.spans[0].content.chars().collect();

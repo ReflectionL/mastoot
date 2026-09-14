@@ -22,7 +22,9 @@ use ratatui::layout::Rect;
 use ratatui_image::picker::{Picker, ProtocolType};
 use ratatui_image::protocol::StatefulProtocol;
 use ratatui_image::{Resize, StatefulImage};
-use tokio::sync::mpsc;
+use std::sync::Arc;
+
+use tokio::sync::{Notify, mpsc};
 use tracing::{debug, warn};
 
 use crate::api::models::MediaId;
@@ -50,6 +52,10 @@ pub struct ImageCache {
     failed: HashSet<MediaId>,
     tx: mpsc::Sender<Completion>,
     rx: mpsc::Receiver<Completion>,
+    /// Pinged after every completed download so the render loop
+    /// redraws right away instead of waiting for the next key press
+    /// or the 30 s tick.
+    notify: Arc<Notify>,
 }
 
 impl ImageCache {
@@ -102,7 +108,49 @@ impl ImageCache {
             failed: HashSet::new(),
             tx,
             rx,
+            notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Handle the render loop can `await` on to be woken when a
+    /// download lands (see [`Notify::notified`]).
+    #[must_use]
+    pub fn wakeup(&self) -> Arc<Notify> {
+        Arc::clone(&self.notify)
+    }
+
+    /// A cache that never renders anything — `[ui] media_render =
+    /// "text_only"`. Every call site keeps working; `enabled()` is
+    /// false so cards fall back to icon + alt-text lines.
+    #[must_use]
+    pub fn disabled() -> Self {
+        let (tx, rx) = mpsc::channel(1);
+        Self {
+            picker: None,
+            init_status: "images: off (config)".into(),
+            cache: HashMap::new(),
+            pending: HashSet::new(),
+            failed: HashSet::new(),
+            tx,
+            rx,
+            notify: Arc::new(Notify::new()),
+        }
+    }
+
+    /// Build from the user's `[ui]` config section.
+    #[must_use]
+    pub fn from_config(media: crate::config::MediaRender, protocol: Option<&str>) -> Self {
+        if media == crate::config::MediaRender::TextOnly {
+            return Self::disabled();
+        }
+        let forced = protocol.and_then(parse_protocol);
+        if protocol.is_some() && forced.is_none() {
+            warn!(
+                ?protocol,
+                "unknown image_protocol in config; auto-detecting"
+            );
+        }
+        Self::with_override(forced.or_else(detect_protocol_override))
     }
 
     /// Whether image rendering is available at all on this terminal.
@@ -136,9 +184,11 @@ impl ImageCache {
         let id = id.clone();
         let url = url.to_string();
         let tx = self.tx.clone();
+        let notify = Arc::clone(&self.notify);
         tokio::spawn(async move {
             let res = download(&url).await;
             let _ = tx.send((id, res)).await;
+            notify.notify_one();
         });
     }
 
@@ -185,6 +235,16 @@ impl ImageCache {
 impl Default for ImageCache {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+fn parse_protocol(name: &str) -> Option<ProtocolType> {
+    match name.trim().to_ascii_lowercase().as_str() {
+        "kitty" => Some(ProtocolType::Kitty),
+        "iterm2" | "iterm" => Some(ProtocolType::Iterm2),
+        "sixel" => Some(ProtocolType::Sixel),
+        "halfblocks" | "halfblock" | "blocks" => Some(ProtocolType::Halfblocks),
+        _ => None,
     }
 }
 
@@ -265,7 +325,7 @@ pub fn draw_overlay(
 
 /// HTTP GET with no auth (Mastodon media URLs are public CDN paths).
 async fn download(url: &str) -> Result<Vec<u8>, String> {
-    let resp = reqwest::Client::new()
+    let resp = crate::api::client::shared_http()
         .get(url)
         .send()
         .await

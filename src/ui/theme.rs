@@ -4,7 +4,7 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Theme {
     // Three-level foreground hierarchy.
     pub fg_primary: Color,
@@ -139,5 +139,11 @@ impl Theme {
 
     pub fn cursor(self) -> Style {
         Style::default().fg(self.accent).bg(self.bg)
+    }
+
+    /// Inline `<code>` / `<pre>` runs. Secondary tier: visibly set
+    /// apart from prose without competing with links or mentions.
+    pub fn code(self) -> Style {
+        self.secondary()
     }
 }

@@ -17,9 +17,10 @@
 //! mpsc channel drained on the UI render tick.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use serde::Deserialize;
-use tokio::sync::mpsc;
+use tokio::sync::{Notify, mpsc};
 use tracing::{debug, warn};
 
 const COMPLETION_CAP: usize = 64;
@@ -84,6 +85,8 @@ pub struct MusicCache {
     failed: HashSet<String>,
     tx: mpsc::Sender<Completion>,
     rx: mpsc::Receiver<Completion>,
+    /// Pinged after each finished lookup so the UI redraws promptly.
+    notify: Arc<Notify>,
 }
 
 impl Default for MusicCache {
@@ -102,7 +105,15 @@ impl MusicCache {
             failed: HashSet::new(),
             tx,
             rx,
+            notify: Arc::new(Notify::new()),
         }
+    }
+
+    /// Handle the render loop can `await` on to be woken when a
+    /// lookup lands.
+    #[must_use]
+    pub fn wakeup(&self) -> Arc<Notify> {
+        Arc::clone(&self.notify)
     }
 
     /// Kick off a lookup for `id` if it's not already in-flight or
@@ -118,9 +129,11 @@ impl MusicCache {
         let id = link.id.clone();
         let kind = link.kind;
         let tx = self.tx.clone();
+        let notify = Arc::clone(&self.notify);
         tokio::spawn(async move {
             let res = lookup(&id, kind).await;
             let _ = tx.send((id, res)).await;
+            notify.notify_one();
         });
     }
 
@@ -246,7 +259,7 @@ async fn lookup(id: &str, kind: AppleMusicKind) -> Result<AppleMusicMeta, String
     // the server toward English metadata; the caller's URL might be
     // for a different store but naming is identical cross-region.
     let url = format!("https://itunes.apple.com/lookup?id={id}&country=us");
-    let resp = reqwest::Client::new()
+    let resp = crate::api::client::shared_http()
         .get(&url)
         .send()
         .await

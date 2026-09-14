@@ -10,7 +10,7 @@
 //! Keep this logic pure — no locale formatting, no timezone conversion. The
 //! Mastodon API always returns UTC; UI code feeds `Utc::now()` as `now`.
 
-use chrono::{DateTime, Datelike, Utc};
+use chrono::{DateTime, Datelike, Local, Utc};
 
 /// Format a past timestamp relative to `now`. Future timestamps (clock
 /// skew, edits) collapse to `now`.
@@ -36,10 +36,29 @@ pub fn relative(now: DateTime<Utc>, ts: DateTime<Utc>) -> String {
     }
 
     if ts.year() == now.year() {
-        ts.format("%b %e").to_string().trim().to_string()
+        ts.format("%b %-d").to_string()
     } else {
-        ts.format("%b %e, %Y").to_string().trim().to_string()
+        ts.format("%b %-d, %Y").to_string()
     }
+}
+
+/// Absolute local-time form, for users who set
+/// `show_relative_time = false`: `Jan 15 14:32`, with the year appended
+/// when it isn't the current one.
+#[must_use]
+pub fn absolute(now: DateTime<Utc>, ts: DateTime<Utc>) -> String {
+    let local = ts.with_timezone(&Local);
+    let fmt = if ts.year() == now.year() {
+        "%b %e %H:%M"
+    } else {
+        "%b %e %Y %H:%M"
+    };
+    local
+        .format(fmt)
+        .to_string()
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 #[cfg(test)]
@@ -85,9 +104,23 @@ mod tests {
     }
 
     #[test]
+    fn single_digit_day_has_no_padding() {
+        let n = utc(2026, 9, 13, 12, 0);
+        assert_eq!(relative(n, utc(2026, 9, 4, 12, 0)), "Sep 4");
+    }
+
+    #[test]
     fn different_year_includes_year() {
         let n = utc(2026, 4, 17, 12, 0);
         assert_eq!(relative(n, utc(2024, 1, 15, 12, 0)), "Jan 15, 2024");
+    }
+
+    #[test]
+    fn absolute_includes_clock_time() {
+        let n = utc(2026, 4, 17, 12, 0);
+        let s = absolute(n, utc(2026, 4, 17, 8, 5));
+        assert!(s.starts_with("Apr"), "{s}");
+        assert!(s.contains(':'), "{s}");
     }
 
     #[test]

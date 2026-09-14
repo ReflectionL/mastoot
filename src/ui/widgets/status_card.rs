@@ -35,7 +35,53 @@ use crate::api::models::{MediaAttachment, MediaType, Status};
 use crate::icons;
 use crate::ui::Theme;
 use crate::ui::widgets::wrap;
+use crate::util::emoji;
 use crate::util::time::relative;
+
+/// User-level rendering preferences shared by every list screen:
+/// icon set, timestamp style and inter-post spacing. Owned by
+/// `ui::app::App` (the `D` key flips density at runtime) and passed
+/// by value into each screen's `render`.
+#[derive(Debug, Clone, Copy)]
+pub struct RenderPrefs {
+    /// Use Nerd Font glyphs (vs ASCII fallbacks).
+    pub nerd_font: bool,
+    /// `Jan 15 14:32` instead of `2h`.
+    pub absolute_time: bool,
+    /// Blank rows between adjacent cards (1 = dense, 2 = spacious).
+    pub inter_post_blank_lines: usize,
+}
+
+impl RenderPrefs {
+    /// Spacious density unlocks the taller presentations (Apple Music
+    /// cover-art cards).
+    #[must_use]
+    pub fn spacious(self) -> bool {
+        self.inter_post_blank_lines > 1
+    }
+
+    /// `CardOpts` seeded from these prefs; callers then set the
+    /// per-card bits (`selected`, `cw_revealed`, …).
+    #[must_use]
+    pub fn card_opts(self) -> CardOpts {
+        CardOpts {
+            nerd_font: self.nerd_font,
+            absolute_time: self.absolute_time,
+            spacious: self.spacious(),
+            ..CardOpts::default()
+        }
+    }
+}
+
+impl Default for RenderPrefs {
+    fn default() -> Self {
+        Self {
+            nerd_font: true,
+            absolute_time: false,
+            inter_post_blank_lines: 1,
+        }
+    }
+}
 
 /// Per-render flags. Bundled into a struct rather than passed as
 /// individual booleans so call sites read `opts.cw_revealed = true`
@@ -58,6 +104,16 @@ pub struct CardOpts {
     /// this on. When false, image media collapses to a single text
     /// caption line (the legacy behavior).
     pub show_images: bool,
+    /// Add a dim `↪ replying to @someone` line under the header when
+    /// the post is a reply. Timeline / profile turn this on; the
+    /// detail page doesn't (the thread itself is the context).
+    pub show_reply_hint: bool,
+    /// Render the timestamp as `Jan 15 14:32` instead of `2h`
+    /// (`[ui] show_relative_time = false`).
+    pub absolute_time: bool,
+    /// Spacious density (2 blank rows between posts): Apple Music links
+    /// expand into cover-art cards instead of a compact inline line.
+    pub spacious: bool,
 }
 
 /// Number of terminal rows reserved per inline image. Wide enough to
@@ -133,14 +189,35 @@ pub fn render_blocks(
     // untouched, and the overlay offset is mapped post-wrap via
     // `wrap_lines_with_map`.
     let music_enrichments = if let Some(ref mut cache) = music {
-        enrich_apple_music(&mut pre_lines, &body_links, cache, opts.nerd_font, theme)
+        enrich_apple_music(
+            &mut pre_lines,
+            &body_links,
+            cache,
+            opts.nerd_font,
+            opts.spacious,
+            theme,
+        )
     } else {
         Vec::new()
     };
 
-    let (mut wrapped, line_map) = wrap::wrap_lines_with_map(&pre_lines, wrap_w);
-
     let shown = status.reblog.as_deref().unwrap_or(status);
+
+    // Custom emoji: `:blobcat:` stays as text but drops to the
+    // tertiary tier. Runs after link enrichment (which needs the
+    // original span indices) and before wrap.
+    {
+        let codes: Vec<&str> = shown
+            .emojis
+            .iter()
+            .chain(shown.account.emojis.iter())
+            .chain(status.account.emojis.iter())
+            .map(|e| e.shortcode.as_str())
+            .collect();
+        crate::ui::widgets::shortcode::dim_shortcodes(&mut pre_lines, &codes, theme.tertiary());
+    }
+
+    let (mut wrapped, line_map) = wrap::wrap_lines_with_map(&pre_lines, wrap_w);
     let cw_hidden = !shown.spoiler_text.is_empty() && !opts.cw_revealed;
 
     let mut image_overlays: Vec<ImageOverlay> = Vec::new();
@@ -219,7 +296,7 @@ pub fn render_blocks(
                 let alt = m.description.as_deref().unwrap_or("").trim();
                 if !alt.is_empty() {
                     let caption = Line::from(Span::styled(
-                        format!("  {alt}"),
+                        emoji::normalize_owned(&format!("  {alt}")),
                         theme.tertiary().add_modifier(Modifier::ITALIC),
                     ));
                     wrapped.extend(wrap::wrap_lines(&[caption], wrap_w));
@@ -228,6 +305,27 @@ pub fn render_blocks(
                 wrapped.push(media_line(m, theme, opts.nerd_font));
             }
         }
+    }
+
+    // Poll. Rendered as a compact bar list — results are visible
+    // whether or not the viewer has voted (voting itself is a
+    // non-goal for now; the bars are the point).
+    if !cw_hidden && let Some(poll) = &shown.poll {
+        wrapped.push(Line::default());
+        wrapped.extend(poll_lines(poll, theme, wrap_w));
+    }
+
+    // Link preview card. One dim line: `󰌷 Title · provider`. Skipped
+    // when the post already carries media (Mastodon doesn't attach a
+    // card then anyway) or when the link is an Apple Music URL that
+    // got its own enrichment above.
+    if !cw_hidden
+        && shown.media_attachments.is_empty()
+        && let Some(card) = &shown.card
+        && let Some(line) = card_line(card, theme, opts.nerd_font)
+    {
+        wrapped.push(Line::default());
+        wrapped.extend(wrap::wrap_lines(&[line], wrap_w));
     }
 
     // Quoted post. Renders below body+media but above metric line.
@@ -305,20 +403,23 @@ fn build_lines(
         let icon = icons::pick(opts.nerd_font, icons::BOOST, icons::BOOST_ASCII);
         out.push(Line::from(vec![
             Span::styled(format!("{icon} "), theme.boost_style()),
-            Span::styled(format!("@{} boosted", booster.acct), theme.secondary()),
+            Span::styled(
+                emoji::normalize_owned(&format!("@{} boosted", booster.acct)),
+                theme.secondary(),
+            ),
         ]));
     }
 
     // Header: display_name (bold) · @handle (secondary) · timestamp (tertiary).
-    let display = if shown.account.display_name.is_empty() {
+    let display = emoji::normalize_owned(&if shown.account.display_name.is_empty() {
         shown.account.username.clone()
     } else {
         shown.account.display_name.clone()
-    };
-    let handle = format!("@{}", shown.account.acct);
+    });
+    let handle = emoji::normalize_owned(&format!("@{}", shown.account.acct));
     let time = shown
         .created_at
-        .map(|ts| relative(Utc::now(), ts))
+        .map(|ts| format_time(ts, opts.absolute_time))
         .unwrap_or_default();
 
     let mut header = vec![
@@ -357,6 +458,19 @@ fn build_lines(
     }
     out.push(Line::from(header));
 
+    // Reply hint. Cheap context that Phanpy / Ice Cubes both surface:
+    // who this post answers, resolved from the `mentions` list the
+    // server already sent (no extra fetch).
+    if opts.show_reply_hint
+        && shown.in_reply_to_id.is_some()
+        && let Some(hint) = reply_hint(shown)
+    {
+        out.push(Line::from(vec![
+            Span::styled("↪ ", theme.tertiary()),
+            Span::styled(hint, theme.tertiary()),
+        ]));
+    }
+
     // Content-warning banner.
     let cw_present = !shown.spoiler_text.is_empty();
     if cw_present {
@@ -364,7 +478,7 @@ fn build_lines(
         out.push(Line::from(vec![
             Span::styled(format!("{warn} "), theme.favorite_style()),
             Span::styled(
-                format!("CW: {}", shown.spoiler_text),
+                emoji::normalize_owned(&format!("CW: {}", shown.spoiler_text)),
                 theme.secondary().add_modifier(Modifier::ITALIC),
             ),
         ]));
@@ -528,6 +642,7 @@ fn enrich_apple_music(
     links: &[html::LinkRef],
     music: &mut crate::api::music::MusicCache,
     nerd_font: bool,
+    spacious: bool,
     theme: &Theme,
 ) -> Vec<MusicEnrichment> {
     let icon = if nerd_font {
@@ -535,7 +650,6 @@ fn enrich_apple_music(
     } else {
         ICON_MUSIC_ASCII
     };
-    let spacious = inter_post_blank_lines() > 1;
     let mut enrichments: Vec<MusicEnrichment> = Vec::new();
 
     // Collect matching links. Process later spans on each line first
@@ -579,7 +693,7 @@ fn enrich_apple_music(
             // Compact text: `󰝚 · Title · Artist`. Dot separators on
             // both sides of the title for visual rhythm — matches
             // the title↔artist separator the user has been seeing.
-            let compact_text = match &meta {
+            let compact_text = emoji::normalize_owned(&match &meta {
                 Some(m) if !m.artist.is_empty() => {
                     format!("{icon} · {} · {}", m.title, m.artist)
                 }
@@ -588,7 +702,7 @@ fn enrich_apple_music(
                     "{icon} · Apple Music · {}",
                     crate::api::music::humanize_slug(&ml.slug)
                 ),
-            };
+            });
             line.spans.splice(
                 lr.span_range.clone(),
                 [Span::styled(
@@ -626,15 +740,15 @@ fn music_card_rows(
     let indent_str: String = " ".repeat(indent_cols as usize);
 
     // Build a row with `indent` + `text` for each wrapped chunk.
-    // `wrap_text` respects char widths so CJK / emoji work.
+    // Goes through the shared span-aware wrapper so CJK / emoji
+    // widths and break rules match the post body.
     let wrap = |text: &str, style: Style| -> Vec<Line<'static>> {
-        wrap_text(text, text_avail)
+        let logical = Line::from(Span::styled(text.to_string(), style));
+        wrap::wrap_lines(&[logical], text_avail)
             .into_iter()
-            .map(|chunk| {
-                Line::from(vec![
-                    Span::raw(indent_str.clone()),
-                    Span::styled(chunk, style),
-                ])
+            .map(|mut chunk| {
+                chunk.spans.insert(0, Span::raw(indent_str.clone()));
+                chunk
             })
             .collect()
     };
@@ -645,12 +759,15 @@ fn music_card_rows(
     out.push(Line::default());
     // Title — primary + bold.
     out.extend(wrap(
-        &meta.title,
+        &emoji::normalize_owned(&meta.title),
         theme.primary().add_modifier(Modifier::BOLD),
     ));
     // Artist — secondary.
     if !meta.artist.is_empty() {
-        out.extend(wrap(&meta.artist, theme.secondary()));
+        out.extend(wrap(
+            &emoji::normalize_owned(&meta.artist),
+            theme.secondary(),
+        ));
     }
     // Album · Year — tertiary.
     let album_line = {
@@ -666,7 +783,7 @@ fn music_card_rows(
         parts.join("  ·  ")
     };
     if !album_line.is_empty() {
-        out.extend(wrap(&album_line, theme.tertiary()));
+        out.extend(wrap(&emoji::normalize_owned(&album_line), theme.tertiary()));
     }
     // Kind label — very dim.
     out.extend(wrap(
@@ -682,102 +799,6 @@ fn music_card_rows(
     // the card expanded past the floor.
     if out.last().is_some_and(|l| !l.spans.is_empty()) {
         out.push(Line::default());
-    }
-    out
-}
-
-/// Simple visible-width aware wrap for a plain text run (no spans,
-/// no styles). Breaks on whitespace when possible; hard-breaks
-/// mid-word when the next token alone would overflow. Mirrors
-/// [`crate::ui::widgets::wrap`] policy but operates on owned
-/// strings.
-fn wrap_text(text: &str, width: u16) -> Vec<String> {
-    if width == 0 || text.is_empty() {
-        return vec![text.to_string()];
-    }
-    let width = width as usize;
-    let mut out: Vec<String> = Vec::new();
-    let mut current = String::new();
-    let mut current_w = 0usize;
-    let mut pending = String::new();
-    let mut pending_w = 0usize;
-
-    let flush_pending = |current: &mut String,
-                         current_w: &mut usize,
-                         pending: &mut String,
-                         pending_w: &mut usize,
-                         out: &mut Vec<String>| {
-        if *pending_w == 0 {
-            return;
-        }
-        if *current_w + *pending_w > width {
-            if *current_w > 0 {
-                out.push(std::mem::take(current));
-                *current_w = 0;
-            }
-            // Pending alone overflows — hard-break.
-            if *pending_w > width {
-                let mut chunk = String::new();
-                let mut chunk_w = 0usize;
-                for c in pending.chars() {
-                    let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-                    if chunk_w + w > width && !chunk.is_empty() {
-                        out.push(std::mem::take(&mut chunk));
-                        chunk_w = 0;
-                    }
-                    chunk.push(c);
-                    chunk_w += w;
-                }
-                *current = chunk;
-                *current_w = chunk_w;
-            } else {
-                *current = std::mem::take(pending);
-                *current_w = *pending_w;
-            }
-        } else {
-            current.push_str(pending);
-            *current_w += *pending_w;
-        }
-        pending.clear();
-        *pending_w = 0;
-    };
-
-    for c in text.chars() {
-        if c.is_whitespace() {
-            flush_pending(
-                &mut current,
-                &mut current_w,
-                &mut pending,
-                &mut pending_w,
-                &mut out,
-            );
-            let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-            if current_w + w > width && current_w > 0 {
-                out.push(std::mem::take(&mut current));
-                current_w = 0;
-                continue;
-            }
-            if current_w > 0 || !current.is_empty() {
-                current.push(c);
-                current_w += w;
-            }
-        } else {
-            pending.push(c);
-            pending_w += unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
-        }
-    }
-    flush_pending(
-        &mut current,
-        &mut current_w,
-        &mut pending,
-        &mut pending_w,
-        &mut out,
-    );
-    if !current.is_empty() {
-        out.push(current);
-    }
-    if out.is_empty() {
-        out.push(String::new());
     }
     out
 }
@@ -812,12 +833,12 @@ fn quote_block(
     };
 
     // Quoted header. Dim italic display name + plain @handle + time.
-    let display = if quoted.account.display_name.is_empty() {
+    let display = emoji::normalize_owned(&if quoted.account.display_name.is_empty() {
         quoted.account.username.clone()
     } else {
         quoted.account.display_name.clone()
-    };
-    let handle = format!("@{}", quoted.account.acct);
+    });
+    let handle = emoji::normalize_owned(&format!("@{}", quoted.account.acct));
     let time = quoted
         .created_at
         .map(|ts| relative(Utc::now(), ts))
@@ -845,11 +866,21 @@ fn quote_block(
     // Phase 4 polish if it turns out to bite.
     if !quoted.spoiler_text.is_empty() {
         logical.push(Line::from(Span::styled(
-            format!("CW: {}", quoted.spoiler_text),
+            emoji::normalize_owned(&format!("CW: {}", quoted.spoiler_text)),
             theme.tertiary().add_modifier(Modifier::ITALIC),
         )));
     }
     logical.extend(html::render(&quoted.content, theme));
+
+    {
+        let codes: Vec<&str> = quoted
+            .emojis
+            .iter()
+            .chain(quoted.account.emojis.iter())
+            .map(|e| e.shortcode.as_str())
+            .collect();
+        crate::ui::widgets::shortcode::dim_shortcodes(&mut logical, &codes, theme.tertiary());
+    }
 
     // Dim the body so it visibly recedes from the host post.
     for line in &mut logical {
@@ -869,6 +900,130 @@ fn quote_block(
         out.push(Line::from(spans));
     }
     out
+}
+
+fn format_time(ts: chrono::DateTime<Utc>, absolute: bool) -> String {
+    if absolute {
+        crate::util::time::absolute(Utc::now(), ts)
+    } else {
+        relative(Utc::now(), ts)
+    }
+}
+
+/// `replying to @acct`, `in a thread` (self-reply), or `reply` when the
+/// server didn't tell us who. `None` only when the status isn't a
+/// reply at all.
+fn reply_hint(s: &Status) -> Option<String> {
+    let target = s.in_reply_to_account_id.as_ref()?;
+    if *target == s.account.id {
+        return Some("in a thread".to_string());
+    }
+    let acct = s
+        .mentions
+        .iter()
+        .find(|m| m.id == *target)
+        .map(|m| m.acct.as_str());
+    Some(match acct {
+        Some(a) => emoji::normalize_owned(&format!("replying to @{a}")),
+        None => "reply".to_string(),
+    })
+}
+
+/// Width of the poll result bar in cells.
+const POLL_BAR_WIDTH: usize = 10;
+
+/// One line per option (`▰▰▰▱▱ 42%  Title`) plus a dim footer with the
+/// vote count and expiry. Own votes get a trailing check.
+fn poll_lines(poll: &crate::api::models::Poll, theme: &Theme, wrap_w: u16) -> Vec<Line<'static>> {
+    let total = poll
+        .voters_count
+        .filter(|_| poll.multiple)
+        .unwrap_or(poll.votes_count)
+        .max(1);
+    let own: Vec<u32> = poll.own_votes.clone().unwrap_or_default();
+    let mut logical: Vec<Line<'static>> = Vec::new();
+    for (i, opt) in poll.options.iter().enumerate() {
+        let votes = opt.votes_count.unwrap_or(0);
+        let pct = ((votes as f64 / total as f64) * 100.0).round() as usize;
+        let filled = (pct * POLL_BAR_WIDTH).div_ceil(100).min(POLL_BAR_WIDTH);
+        let mine = own.contains(&(i as u32));
+        let bar_style = if mine {
+            theme.link()
+        } else {
+            theme.secondary()
+        };
+        let mut spans = vec![
+            Span::styled("▰".repeat(filled), bar_style),
+            Span::styled("▱".repeat(POLL_BAR_WIDTH - filled), theme.tertiary()),
+            Span::styled(format!(" {pct:>3}%  "), theme.tertiary()),
+            Span::styled(emoji::normalize_owned(&opt.title), theme.primary()),
+        ];
+        if mine {
+            spans.push(Span::styled("  ✓", theme.link()));
+        }
+        logical.push(Line::from(spans));
+    }
+    let votes_label = if poll.multiple {
+        format!("{} voters", poll.voters_count.unwrap_or(poll.votes_count))
+    } else {
+        format!("{} votes", poll.votes_count)
+    };
+    let when = if poll.expired {
+        "final".to_string()
+    } else if let Some(exp) = poll.expires_at {
+        let left = exp.signed_duration_since(Utc::now());
+        if left.num_seconds() <= 0 {
+            "final".to_string()
+        } else if left.num_hours() >= 48 {
+            format!("ends in {}d", left.num_days())
+        } else if left.num_minutes() >= 90 {
+            format!("ends in {}h", left.num_hours())
+        } else {
+            format!("ends in {}m", left.num_minutes().max(1))
+        }
+    } else {
+        "open".to_string()
+    };
+    logical.push(Line::from(Span::styled(
+        format!("{votes_label}  ·  {when}"),
+        theme.tertiary(),
+    )));
+    wrap::wrap_lines(&logical, wrap_w)
+}
+
+/// `󰌷 Title · provider-or-host`, or `None` when the card carries no
+/// title or points at an Apple Music URL (handled by the enrichment
+/// path instead).
+fn card_line(
+    card: &crate::api::models::Card,
+    theme: &Theme,
+    nerd_font: bool,
+) -> Option<Line<'static>> {
+    let title = card.title.trim();
+    if title.is_empty() || crate::api::music::parse_url(&card.url).is_some() {
+        return None;
+    }
+    let source = card
+        .provider_name
+        .as_deref()
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            url::Url::parse(&card.url).ok().and_then(|u| {
+                u.host_str()
+                    .map(|h| h.trim_start_matches("www.").to_string())
+            })
+        });
+    let icon = icons::pick(nerd_font, icons::LINK, icons::LINK_ASCII);
+    let mut spans = vec![
+        Span::styled(format!("{icon} "), theme.tertiary()),
+        Span::styled(emoji::normalize_owned(title), theme.secondary()),
+    ];
+    if let Some(src) = source {
+        spans.push(Span::styled(format!("  ·  {src}"), theme.tertiary()));
+    }
+    Some(Line::from(spans))
 }
 
 fn metric_line(s: &Status, theme: &Theme, nerd_font: bool) -> Line<'static> {
@@ -911,27 +1066,9 @@ fn media_line(m: &MediaAttachment, theme: &Theme, nerd_font: bool) -> Line<'stat
     let text = if alt.is_empty() {
         format!("{icon}  [{:?}]", m.media_type)
     } else {
-        format!("{icon}  {alt}")
+        emoji::normalize_owned(&format!("{icon}  {alt}"))
     };
     Line::from(vec![Span::styled(text, theme.secondary())])
-}
-
-/// Inter-post blank-line count. Runtime-toggleable via `D` so the
-/// user can A/B between density (1, default) and breathing room (2)
-/// without restarting. Stored in an atomic so render code can read
-/// it without threading a context through every screen.
-static INTER_POST_BLANK_LINES_CELL: std::sync::atomic::AtomicUsize =
-    std::sync::atomic::AtomicUsize::new(1);
-
-/// Read the current inter-post blank-line count.
-#[must_use]
-pub fn inter_post_blank_lines() -> usize {
-    INTER_POST_BLANK_LINES_CELL.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Set the inter-post blank-line count, clamped to `[1, 3]`.
-pub fn set_inter_post_blank_lines(n: usize) {
-    INTER_POST_BLANK_LINES_CELL.store(n.clamp(1, 3), std::sync::atomic::Ordering::Relaxed);
 }
 
 #[cfg(test)]
@@ -1164,6 +1301,128 @@ mod tests {
             .flat_map(|l| l.spans.iter().map(|sp| sp.content.as_ref()))
             .collect();
         assert!(text.contains("[quote revoked]"));
+    }
+
+    #[test]
+    fn reply_hint_names_the_mentioned_account() {
+        use crate::api::models::{AccountId, Mention};
+        let theme = Theme::frost();
+        let mut s = fake_status("1", "<p>yes</p>");
+        s.in_reply_to_id = Some(StatusId::new("0"));
+        s.in_reply_to_account_id = Some(AccountId::new("bob-id"));
+        s.mentions.push(Mention {
+            id: AccountId::new("bob-id"),
+            username: "bob".into(),
+            url: String::new(),
+            acct: "bob@ex.com".into(),
+        });
+        let opts = CardOpts {
+            show_reply_hint: true,
+            ..opts_plain()
+        };
+        let text: String = render(&s, &theme, opts, 80)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|sp| sp.content.as_ref()))
+            .collect();
+        assert!(text.contains("replying to @bob@ex.com"), "{text}");
+        // Off by default (detail page).
+        let text2: String = render(&s, &theme, opts_plain(), 80)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|sp| sp.content.as_ref()))
+            .collect();
+        assert!(!text2.contains("replying to"));
+    }
+
+    #[test]
+    fn poll_renders_bars_and_footer() {
+        use crate::api::models::{Poll, PollId, PollOption};
+        let theme = Theme::frost();
+        let mut s = fake_status("1", "<p>vote!</p>");
+        s.poll = Some(Poll {
+            id: PollId::new("p"),
+            expires_at: None,
+            expired: true,
+            multiple: false,
+            votes_count: 4,
+            voters_count: None,
+            options: vec![
+                PollOption {
+                    title: "tabs".into(),
+                    votes_count: Some(3),
+                },
+                PollOption {
+                    title: "spaces".into(),
+                    votes_count: Some(1),
+                },
+            ],
+            emojis: vec![],
+            voted: Some(true),
+            own_votes: Some(vec![0]),
+        });
+        let text: String = render(&s, &theme, opts_plain(), 80)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|sp| sp.content.as_ref()))
+            .collect();
+        assert!(text.contains("75%"), "{text}");
+        assert!(text.contains("tabs"));
+        assert!(text.contains("✓"));
+        assert!(text.contains("4 votes"));
+        assert!(text.contains("final"));
+    }
+
+    #[test]
+    fn link_card_shows_title_and_host() {
+        use crate::api::models::Card;
+        let theme = Theme::frost();
+        let mut s = fake_status("1", "<p>read this</p>");
+        s.card = Some(Card {
+            url: "https://www.example.org/post/1".into(),
+            title: "A Fine Article".into(),
+            description: String::new(),
+            card_type: crate::api::models::CardType::default(),
+            author_name: None,
+            author_url: None,
+            provider_name: None,
+            provider_url: None,
+            html: None,
+            width: None,
+            height: None,
+            image: None,
+            embed_url: None,
+            blurhash: None,
+        });
+        let text: String = render(&s, &theme, opts_plain(), 80)
+            .iter()
+            .flat_map(|l| l.spans.iter().map(|sp| sp.content.as_ref()))
+            .collect();
+        assert!(text.contains("A Fine Article"), "{text}");
+        assert!(text.contains("example.org"), "{text}");
+    }
+
+    #[test]
+    fn custom_emoji_shortcode_is_dimmed_in_body_and_name() {
+        use crate::api::models::CustomEmoji;
+        let theme = Theme::frost();
+        let mut s = fake_status("1", "<p>hello :blobcat: world</p>");
+        s.account.display_name = "Alice :verified:".into();
+        let mk = |c: &str| CustomEmoji {
+            shortcode: c.into(),
+            url: String::new(),
+            static_url: String::new(),
+            visible_in_picker: true,
+            category: None,
+        };
+        s.emojis.push(mk("blobcat"));
+        s.account.emojis.push(mk("verified"));
+        let lines = render(&s, &theme, opts_plain(), 80);
+        let dimmed: Vec<String> = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter(|sp| sp.style.fg == Some(theme.fg_tertiary))
+            .map(|sp| sp.content.to_string())
+            .collect();
+        assert!(dimmed.iter().any(|t| t == ":blobcat:"), "{dimmed:?}");
+        assert!(dimmed.iter().any(|t| t == ":verified:"), "{dimmed:?}");
     }
 
     #[test]

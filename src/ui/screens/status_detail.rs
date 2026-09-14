@@ -23,7 +23,7 @@ use crate::state::Action;
 use crate::state::event::FailedAction;
 use crate::ui::Theme;
 use crate::ui::images::{self, ImageCache};
-use crate::ui::widgets::status_card::{self, CardOpts, ImageOverlay};
+use crate::ui::widgets::status_card::{self, ImageOverlay, RenderPrefs};
 
 /// Result of a key press inside the detail screen.
 pub enum DetailOutcome {
@@ -122,6 +122,23 @@ impl DetailState {
         for s in &mut self.descendants {
             undo(s);
         }
+    }
+
+    /// Drop a deleted status from the thread. Returns `true` when the
+    /// deleted post *is* the focal — the caller should leave the page,
+    /// there's nothing to anchor the thread on anymore.
+    pub fn on_status_deleted(&mut self, id: &StatusId) -> bool {
+        let hits = |s: &Status| s.id == *id || s.reblog.as_ref().is_some_and(|r| r.id == *id);
+        if hits(&self.focal) {
+            return true;
+        }
+        let before = self.total();
+        self.ancestors.retain(|s| !hits(s));
+        self.descendants.retain(|s| !hits(s));
+        if self.total() != before {
+            self.selected = self.selected.min(self.total() - 1);
+        }
+        false
     }
 
     fn total(&self) -> usize {
@@ -288,7 +305,7 @@ impl DetailState {
         frame: &mut Frame<'_>,
         area: Rect,
         theme: &Theme,
-        nerd_font: bool,
+        prefs: RenderPrefs,
         images: &mut ImageCache,
         music: &mut MusicCache,
     ) {
@@ -302,16 +319,16 @@ impl DetailState {
                 "  loading thread…",
                 theme.tertiary(),
             )));
-            for _ in 0..status_card::inter_post_blank_lines() {
+            for _ in 0..prefs.inter_post_blank_lines {
                 lines.push(Line::default());
             }
             let focal_inner_id = &self.focal.reblog.as_deref().unwrap_or(&self.focal).id;
-            let opts = CardOpts {
+            let opts = status_card::CardOpts {
                 selected: true,
-                nerd_font,
                 show_metrics: true,
                 cw_revealed: self.revealed.contains(focal_inner_id),
                 show_images: images.enabled(),
+                ..prefs.card_opts()
             };
             let block =
                 status_card::render_blocks(&self.focal, theme, opts, inner_width, Some(music));
@@ -344,18 +361,18 @@ impl DetailState {
                 std::cmp::Ordering::Greater => &self.descendants[idx - n_anc - 1],
             };
             if !lines.is_empty() {
-                for _ in 0..status_card::inter_post_blank_lines() {
+                for _ in 0..prefs.inter_post_blank_lines {
                     lines.push(Line::default());
                 }
             }
             let inner_id = &status.reblog.as_deref().unwrap_or(status).id;
             let is_focal = idx == n_anc;
-            let opts = CardOpts {
+            let opts = status_card::CardOpts {
                 selected: idx == self.selected,
-                nerd_font,
                 show_metrics: is_focal,
                 cw_revealed: self.revealed.contains(inner_id),
                 show_images: images_enabled,
+                ..prefs.card_opts()
             };
             // Every status in the thread gets the music cache so
             // Apple Music links render compactly (`󰝚 Artist · Title`)
@@ -376,8 +393,9 @@ impl DetailState {
             }
         }
 
-        // Keep the selected card inside `area` by adjusting scroll.
-        let height = area.height;
+        // Keep the selected card inside `area` by adjusting scroll
+        // (minus the Block's one-row top padding).
+        let height = area.height.saturating_sub(1);
         let (sel_start, sel_end) = sel_range;
         if sel_start < self.scroll {
             self.scroll = sel_start;
@@ -490,6 +508,16 @@ mod tests {
         let f = d.selected_target().unwrap();
         assert_eq!(f.favourited, Some(false));
         assert_eq!(f.favourites_count, 0);
+    }
+
+    #[test]
+    fn deleting_a_reply_removes_it_and_keeps_cursor_valid() {
+        let mut d = DetailState::new(fake("focal"));
+        d.on_context_loaded(vec![], vec![fake("d1"), fake("d2")]);
+        d.selected = 2; // d2
+        assert!(!d.on_status_deleted(&StatusId::new("d2")));
+        assert_eq!(d.selected, 1);
+        assert!(d.on_status_deleted(&StatusId::new("focal")));
     }
 
     #[test]

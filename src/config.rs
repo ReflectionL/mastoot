@@ -68,6 +68,11 @@ pub struct UiConfig {
     /// Default live-update mode at startup. Runtime `S` toggles
     /// without persisting — edit the config to change the default.
     pub stream_mode: crate::state::StreamMode,
+    /// Force an inline-image protocol instead of probing the terminal:
+    /// `"kitty"`, `"iterm2"`, `"sixel"` or `"halfblocks"`. Leave unset
+    /// to auto-detect. Useful when a multiplexer hides the real
+    /// terminal from the probe.
+    pub image_protocol: Option<String>,
 }
 
 impl Default for UiConfig {
@@ -77,6 +82,7 @@ impl Default for UiConfig {
             media_render: MediaRender::Auto,
             nerd_font: true,
             stream_mode: crate::state::StreamMode::default(),
+            image_protocol: None,
         }
     }
 }

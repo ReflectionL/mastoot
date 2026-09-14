@@ -16,6 +16,7 @@ use crate::state::Action;
 use crate::state::event::AccountListKind;
 use crate::ui::Theme;
 use crate::ui::widgets::wrap;
+use crate::util::emoji;
 
 const LOAD_MORE_TRIGGER: usize = 5;
 
@@ -42,6 +43,7 @@ pub struct AccountListScreen {
     last_g: bool,
     pub load_more_pending: bool,
     pub loading: bool,
+    pub exhausted: bool,
 }
 
 impl AccountListScreen {
@@ -57,13 +59,21 @@ impl AccountListScreen {
             last_g: false,
             load_more_pending: false,
             loading: true,
+            exhausted: false,
         }
+    }
+
+    /// The fetch failed — clear loading / pending so a retry can fire.
+    pub fn on_load_failed(&mut self) {
+        self.loading = false;
+        self.load_more_pending = false;
     }
 
     pub fn on_loaded(&mut self, accounts: Vec<Account>, appended: bool) {
         if appended {
             // Cheap dedup by id since the server may overlap pages on a
             // since_id boundary (rare, but cheap to defend against).
+            let before = self.accounts.len();
             let known: std::collections::HashSet<_> =
                 self.accounts.iter().map(|a| a.id.clone()).collect();
             for a in accounts {
@@ -71,10 +81,14 @@ impl AccountListScreen {
                     self.accounts.push(a);
                 }
             }
+            if self.accounts.len() == before {
+                self.exhausted = true;
+            }
         } else {
             self.accounts = accounts;
             self.selected = 0;
             self.scroll = 0;
+            self.exhausted = false;
         }
         self.loading = false;
         self.load_more_pending = false;
@@ -134,7 +148,11 @@ impl AccountListScreen {
     }
 
     fn check_load_more(&mut self, len: usize) -> AccountListOutcome {
-        if !self.load_more_pending && len > 0 && self.selected + LOAD_MORE_TRIGGER >= len {
+        if !self.load_more_pending
+            && !self.exhausted
+            && len > 0
+            && self.selected + LOAD_MORE_TRIGGER >= len
+        {
             self.load_more_pending = true;
             let max_id = self.accounts.last().map(|a| a.id.0.clone());
             AccountListOutcome::Dispatch(Action::LoadAccountList {
@@ -183,7 +201,8 @@ impl AccountListScreen {
             }
         }
 
-        let height = area.height;
+        // Minus the Block's one-row top padding.
+        let height = area.height.saturating_sub(1);
         let (sel_start, sel_end) = sel_range;
         if !self.accounts.is_empty() {
             if sel_start < self.scroll {
@@ -220,18 +239,18 @@ impl AccountListScreen {
 /// chips later]) and a one-line dim bio excerpt (first wrapped line of
 /// the user's note). Already-wrapped to `inner_width`. Selected row
 /// gets the standard 2-col cursor gutter.
-fn render_account_card(
+pub(crate) fn render_account_card(
     acc: &Account,
     theme: &Theme,
     selected: bool,
     inner_width: u16,
 ) -> Vec<Line<'static>> {
-    let display = if acc.display_name.is_empty() {
+    let display = emoji::normalize_owned(&if acc.display_name.is_empty() {
         acc.username.clone()
     } else {
         acc.display_name.clone()
-    };
-    let handle = format!("@{}", acc.acct);
+    });
+    let handle = emoji::normalize_owned(&format!("@{}", acc.acct));
     let mut header = vec![
         Span::styled(display, theme.display_name()),
         Span::raw("  "),
@@ -251,6 +270,8 @@ fn render_account_card(
         ));
     }
     let mut logical = vec![Line::from(header)];
+    let codes: Vec<&str> = acc.emojis.iter().map(|e| e.shortcode.as_str()).collect();
+    crate::ui::widgets::shortcode::dim_shortcodes(&mut logical, &codes, theme.tertiary());
 
     if !acc.note.is_empty() {
         let bio = html::render(&acc.note, theme);

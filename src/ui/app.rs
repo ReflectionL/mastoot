@@ -9,6 +9,7 @@
 
 use std::collections::HashMap;
 use std::io;
+use std::time::Instant;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
@@ -47,13 +48,15 @@ use crate::ui::screens::compose::{
 };
 use crate::ui::screens::notifications::{NotifOutcome, NotificationsScreen};
 use crate::ui::screens::profile::{ProfileOutcome, ProfileScreen};
+use crate::ui::screens::search::{SearchOutcome, SearchScreen};
 use crate::ui::screens::status_detail::{DetailOutcome, DetailState};
 use crate::ui::screens::timeline::TimelineScreen;
+use crate::ui::widgets::status_card::RenderPrefs;
 
 /// Size of the in-memory toast buffer. Additional toasts bump older ones.
 const TOAST_LIMIT: usize = 3;
-/// How long a toast stays on screen, in seconds.
-const TOAST_TTL_SECS: u64 = 4;
+/// How long a toast stays on screen.
+const TOAST_TTL: Duration = Duration::from_secs(4);
 
 type Term = Terminal<CrosstermBackend<io::Stdout>>;
 
@@ -80,8 +83,7 @@ pub async fn run(client: MastodonClient, cfg: Config) -> Result<()> {
         .await;
 
     let theme = Theme::by_name(&cfg.theme.name);
-    let nerd_font = cfg.ui.nerd_font;
-    let mut app = App::new(theme, nerd_font, initial_mode, cfg);
+    let mut app = App::new(theme, initial_mode, cfg);
 
     let outcome = Box::pin(main_loop(&mut term, &mut app, &mut handle)).await;
     leave_terminal(&mut term);
@@ -92,6 +94,15 @@ pub async fn run(client: MastodonClient, cfg: Config) -> Result<()> {
 async fn main_loop(term: &mut Term, app: &mut App, handle: &mut Handle) -> Result<()> {
     let mut keys = EventStream::new();
     let mut tick = new_ticker();
+    // Fires once a second, but only while a toast is on screen — see
+    // the branch guard below. Keeps idle redraws at the 30 s cadence.
+    let mut toast_tick = interval(Duration::from_secs(1));
+    toast_tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Background downloads (images, Apple Music metadata) ping these
+    // when they finish; without them a picture would only appear on
+    // the next key press or 30 s tick.
+    let image_wakeup = app.images.wakeup();
+    let music_wakeup = app.music.wakeup();
 
     loop {
         term.draw(|frame| app.render(frame))?;
@@ -111,6 +122,11 @@ async fn main_loop(term: &mut Term, app: &mut App, handle: &mut Handle) -> Resul
             _ = tick.tick() => {
                 app.on_tick();
             }
+            _ = toast_tick.tick(), if !app.toasts.is_empty() => {
+                app.expire_toasts();
+            }
+            () = image_wakeup.notified() => {}
+            () = music_wakeup.notified() => {}
             else => return Ok(()),
         }
     }
@@ -129,6 +145,10 @@ fn new_ticker() -> Interval {
 struct App {
     theme: Theme,
     nerd_font: bool,
+    /// `[ui] show_relative_time = false` → `Jan 15 14:32` timestamps.
+    absolute_time: bool,
+    /// Blank rows between posts; `D` flips 1 ↔ 2 at runtime.
+    density: usize,
     active: TimelineKind,
     screens: HashMap<TimelineKind, TimelineScreen>,
     timelines: HashMap<TimelineKind, Vec<Status>>,
@@ -198,16 +218,26 @@ enum Mode {
     /// "Delete this post? Enter · Esc" confirm. Only reachable after
     /// an ownership check (user pressed `d` on their own post).
     DeleteConfirm(StatusId),
+    /// One-line query being typed after `/`. Rendered in the status
+    /// row; `Enter` turns it into [`Mode::Search`].
+    SearchPrompt(String),
+    /// Search results (`/api/v2/search` or a hashtag timeline).
+    Search(SearchScreen),
+    /// "Quit? Enter · Esc" confirm, entered with `Esc` from a
+    /// top-level timeline. `Ctrl+C` still quits instantly; the modal
+    /// exists because `Esc` is also "go back" one level up, and two
+    /// reflexive presses shouldn't end the session.
+    QuitConfirm,
 }
 
 struct Toast {
     level: ToastLevel,
     message: String,
-    ticks_remaining: u8,
+    created: Instant,
 }
 
 impl App {
-    fn new(theme: Theme, nerd_font: bool, stream_mode: StreamMode, cfg: Config) -> Self {
+    fn new(theme: Theme, stream_mode: StreamMode, cfg: Config) -> Self {
         let mut screens = HashMap::new();
         for k in [
             TimelineKind::Home,
@@ -217,10 +247,14 @@ impl App {
         ] {
             screens.insert(k, TimelineScreen::new(k));
         }
-        let images = ImageCache::new();
+        let images = ImageCache::from_config(cfg.ui.media_render, cfg.ui.image_protocol.as_deref());
+        let nerd_font = cfg.ui.nerd_font;
+        let absolute_time = !cfg.ui.show_relative_time;
         Self {
             theme,
             nerd_font,
+            absolute_time,
+            density: 1,
             active: TimelineKind::Home,
             screens,
             timelines: HashMap::new(),
@@ -239,6 +273,15 @@ impl App {
             music: MusicCache::new(),
             cfg,
             splash: true,
+        }
+    }
+
+    /// Rendering preferences handed to every list screen.
+    fn prefs(&self) -> RenderPrefs {
+        RenderPrefs {
+            nerd_font: self.nerd_font,
+            absolute_time: self.absolute_time,
+            inter_post_blank_lines: self.density,
         }
     }
 
@@ -299,12 +342,7 @@ impl App {
             && !key.modifiers.contains(KeyModifiers::CONTROL)
             && !matches!(self.mode, Mode::Compose(_) | Mode::ComposeConfirmDiscard(_))
         {
-            let cur = crate::ui::widgets::status_card::inter_post_blank_lines();
-            crate::ui::widgets::status_card::set_inter_post_blank_lines(if cur >= 2 {
-                1
-            } else {
-                2
-            });
+            self.density = if self.density >= 2 { 1 } else { 2 };
             return true;
         }
 
@@ -321,20 +359,19 @@ impl App {
             return true;
         }
 
-        // `Q` opens the quoted post of the currently selected status.
-        // Dedicated key (vs. reusing `l` / `Enter`) keeps "open outer
-        // post" and "open quoted post" unambiguous. Works wherever a
-        // selection exists except compose.
-        if key.code == KeyCode::Char('Q')
+        // `/` opens the search prompt from any browsing mode.
+        if key.code == KeyCode::Char('/')
             && !key.modifiers.contains(KeyModifiers::CONTROL)
-            && !matches!(self.mode, Mode::Compose(_) | Mode::ComposeConfirmDiscard(_))
+            && matches!(
+                self.mode,
+                Mode::Timeline
+                    | Mode::StatusDetail(_)
+                    | Mode::Profile(_)
+                    | Mode::AccountList(_)
+                    | Mode::Search(_)
+            )
         {
-            if let Some(quoted) = self.selected_quoted_status() {
-                let detail = DetailState::new(quoted);
-                let id = detail.focal_id().clone();
-                self.push_mode(Mode::StatusDetail(detail));
-                let _ = tx.send(Action::OpenStatus(id)).await;
-            }
+            self.push_mode(Mode::SearchPrompt(String::new()));
             return true;
         }
 
@@ -357,7 +394,86 @@ impl App {
             return true;
         }
 
+        // Keys that act on "the selected status" behave identically in
+        // timeline / thread / profile, so they're handled once here
+        // instead of per mode below.
+        if self.handle_status_keys(key, tx).await {
+            return true;
+        }
+
         match std::mem::replace(&mut self.mode, Mode::Timeline) {
+            Mode::SearchPrompt(mut query) => {
+                match key.code {
+                    KeyCode::Esc => self.pop_mode(),
+                    KeyCode::Enter => {
+                        let q = query.trim().to_string();
+                        if q.is_empty() {
+                            self.pop_mode();
+                        } else {
+                            // Replace the prompt (not push): the prompt
+                            // is transient, `h` from results should
+                            // return to where `/` was pressed.
+                            self.mode = Mode::Search(SearchScreen::new(q.clone()));
+                            let _ = tx.send(Action::Search { query: q }).await;
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        query.pop();
+                        self.mode = Mode::SearchPrompt(query);
+                    }
+                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        self.mode = Mode::SearchPrompt(String::new());
+                    }
+                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
+                        query.push(c);
+                        self.mode = Mode::SearchPrompt(query);
+                    }
+                    _ => self.mode = Mode::SearchPrompt(query),
+                }
+                return true;
+            }
+            Mode::Search(mut state) => {
+                if let KeyCode::Char('1' | '2' | '3' | '4' | '5') = key.code {
+                    // Tab switch — fall through to timeline keys.
+                    self.mode = Mode::Timeline;
+                } else {
+                    match state.handle_key(key) {
+                        SearchOutcome::Continue => self.mode = Mode::Search(state),
+                        SearchOutcome::Back => self.pop_mode(),
+                        SearchOutcome::Dispatch(a) => {
+                            let _ = tx.send(a).await;
+                            self.mode = Mode::Search(state);
+                        }
+                        SearchOutcome::OpenProfile(acc) => {
+                            self.mode = Mode::Search(state);
+                            self.open_profile(acc, tx).await;
+                        }
+                        SearchOutcome::OpenStatus(s) => {
+                            self.mode = Mode::Search(state);
+                            self.open_detail(s, tx).await;
+                        }
+                        SearchOutcome::SearchTag(name) => {
+                            self.back_stack.push(Mode::Search(state));
+                            self.mode = Mode::Search(SearchScreen::new(format!("#{name}")));
+                            let _ = tx.send(Action::SearchTag { name }).await;
+                        }
+                    }
+                    return true;
+                }
+                // Fall through for tab keys.
+            }
+            Mode::QuitConfirm => {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Char('y' | 'Y') => return false,
+                    KeyCode::Esc | KeyCode::Char('n' | 'N' | 'h') | KeyCode::Backspace => {
+                        self.pop_mode();
+                    }
+                    _ => {
+                        self.mode = Mode::QuitConfirm;
+                    }
+                }
+                return true;
+            }
             Mode::Compose(mut state) => {
                 match state.handle_key(key) {
                     ComposeOutcome::Continue => {
@@ -442,22 +558,6 @@ impl App {
                         self.mode = Mode::Timeline;
                         // fall through to timeline keys
                     }
-                    KeyCode::Char('u') if state.selected_target().is_some() => {
-                        let t = state.selected_target().unwrap().clone();
-                        let acc = t.account.clone();
-                        let id = acc.id.clone();
-                        // Re-stash current profile so `h` returns to it.
-                        self.back_stack.push(Mode::Profile(state));
-                        self.mode = Mode::Profile(ProfileScreen::new(acc, false));
-                        let _ = tx
-                            .send(Action::LoadProfile {
-                                id: id.clone(),
-                                max_id: None,
-                            })
-                            .await;
-                        let _ = tx.send(Action::LoadRelationship(id)).await;
-                        return true;
-                    }
                     KeyCode::Char('o' | 'O') => {
                         let kind = if matches!(key.code, KeyCode::Char('O')) {
                             AccountListKind::Following
@@ -479,29 +579,6 @@ impl App {
                                 max_id: None,
                             })
                             .await;
-                        return true;
-                    }
-                    KeyCode::Char('q')
-                        if !key.modifiers.contains(KeyModifiers::CONTROL)
-                            && state.selected_target().is_some() =>
-                    {
-                        let target = state.selected_target().unwrap().clone();
-                        let quote = quote_context_from(&target, 80);
-                        self.back_stack.push(Mode::Profile(state));
-                        self.mode = Mode::Compose(ComposeState::quote(quote, self.max_chars));
-                        return true;
-                    }
-                    KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        let own_id = state.selected_target().and_then(|t| {
-                            let me_id = self.me.as_ref().map(|a| a.id.clone())?;
-                            (t.account.id == me_id).then(|| t.id.clone())
-                        });
-                        if let Some(id) = own_id {
-                            self.back_stack.push(Mode::Profile(state));
-                            self.mode = Mode::DeleteConfirm(id);
-                        } else {
-                            self.mode = Mode::Profile(state);
-                        }
                         return true;
                     }
                     _ => {
@@ -597,67 +674,6 @@ impl App {
                 return true;
             }
             Mode::StatusDetail(mut state) => {
-                // App-level intercepts that need to switch *modes* go
-                // first; everything else flows into DetailState.
-                match key.code {
-                    KeyCode::Char('r')
-                        if !key.modifiers.contains(KeyModifiers::CONTROL)
-                            && state.selected_target().is_some() =>
-                    {
-                        let target = state.selected_target().unwrap().clone();
-                        let reply = reply_context_from(&target, 80);
-                        let vis = api_to_state_vis(target.visibility);
-                        // Stash the detail; exit_compose() pops it after
-                        // submit / cancel / discard.
-                        self.back_stack.push(Mode::StatusDetail(state));
-                        self.mode = Mode::Compose(ComposeState::reply(reply, vis, self.max_chars));
-                        return true;
-                    }
-                    KeyCode::Char('q')
-                        if !key.modifiers.contains(KeyModifiers::CONTROL)
-                            && state.selected_target().is_some() =>
-                    {
-                        let target = state.selected_target().unwrap().clone();
-                        let quote = quote_context_from(&target, 80);
-                        self.back_stack.push(Mode::StatusDetail(state));
-                        self.mode = Mode::Compose(ComposeState::quote(quote, self.max_chars));
-                        return true;
-                    }
-                    KeyCode::Char('d') if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        let own_id = state.selected_target().and_then(|t| {
-                            let me_id = self.me.as_ref().map(|a| a.id.clone())?;
-                            (t.account.id == me_id).then(|| t.id.clone())
-                        });
-                        if let Some(id) = own_id {
-                            self.back_stack.push(Mode::StatusDetail(state));
-                            self.mode = Mode::DeleteConfirm(id);
-                        } else {
-                            self.mode = Mode::StatusDetail(state);
-                        }
-                        return true;
-                    }
-                    KeyCode::Char('c') => {
-                        self.back_stack.push(Mode::StatusDetail(state));
-                        self.mode = Mode::Compose(ComposeState::blank(self.max_chars));
-                        return true;
-                    }
-                    KeyCode::Char('u') if state.selected_target().is_some() => {
-                        let t = state.selected_target().unwrap().clone();
-                        let acc = t.account.clone();
-                        let id = acc.id.clone();
-                        self.back_stack.push(Mode::StatusDetail(state));
-                        self.mode = Mode::Profile(ProfileScreen::new(acc, false));
-                        let _ = tx
-                            .send(Action::LoadProfile {
-                                id: id.clone(),
-                                max_id: None,
-                            })
-                            .await;
-                        let _ = tx.send(Action::LoadRelationship(id)).await;
-                        return true;
-                    }
-                    _ => {}
-                }
                 match state.handle_key(key) {
                     DetailOutcome::Continue => {
                         self.mode = Mode::StatusDetail(state);
@@ -679,7 +695,9 @@ impl App {
 
         // Timeline mode keys.
         match key.code {
-            KeyCode::Esc => return false,
+            KeyCode::Esc => {
+                self.push_mode(Mode::QuitConfirm);
+            }
             KeyCode::Char('?') => {
                 self.show_help = true;
             }
@@ -688,20 +706,6 @@ impl App {
             KeyCode::Char('3') => self.switch_to(TimelineKind::Federated, tx).await,
             KeyCode::Char('4') => self.switch_to(TimelineKind::Notifications, tx).await,
             KeyCode::Char('5') => self.open_self_profile(tx).await,
-            KeyCode::Char('u') => {
-                if let Some(target) = self.selected_target_status() {
-                    let acc = target.account.clone();
-                    let id = acc.id.clone();
-                    self.push_mode(Mode::Profile(ProfileScreen::new(acc, false)));
-                    let _ = tx
-                        .send(Action::LoadProfile {
-                            id: id.clone(),
-                            max_id: None,
-                        })
-                        .await;
-                    let _ = tx.send(Action::LoadRelationship(id)).await;
-                }
-            }
             KeyCode::Char('f') => {
                 if let Some(action) = self.toggle_favourite_optimistic() {
                     let _ = tx.send(action).await;
@@ -715,24 +719,6 @@ impl App {
             KeyCode::Char('B') => {
                 if let Some(action) = self.force_unreblog_optimistic() {
                     let _ = tx.send(action).await;
-                }
-            }
-            KeyCode::Char('c') => {
-                self.push_mode(Mode::Compose(ComposeState::blank(self.max_chars)));
-            }
-            KeyCode::Char('r') => {
-                if let Some(state) = self.compose_reply_for_selection() {
-                    self.push_mode(Mode::Compose(state));
-                }
-            }
-            KeyCode::Char('q') => {
-                if let Some(state) = self.compose_quote_for_selection() {
-                    self.push_mode(Mode::Compose(state));
-                }
-            }
-            KeyCode::Char('d') => {
-                if let Some(id) = self.selected_own_status_id() {
-                    self.push_mode(Mode::DeleteConfirm(id));
                 }
             }
             KeyCode::Char('l') | KeyCode::Enter => {
@@ -774,23 +760,110 @@ impl App {
         true
     }
 
-    /// Build a ComposeState pre-filled to reply to the currently
-    /// selected status. `r` on a boost replies to the original.
-    fn compose_reply_for_selection(&self) -> Option<ComposeState> {
-        let target = self.selected_target_status()?;
-        let reply = reply_context_from(target, 80);
-        let vis = api_to_state_vis(target.visibility);
-        Some(ComposeState::reply(reply, vis, self.max_chars))
+    /// Status-scoped keys shared by every mode that has a selected
+    /// post (timeline incl. notifications, thread, profile). Returns
+    /// `true` when the key was consumed. Keys that only make sense in
+    /// one place (`o` = followers inside a profile) are left to that
+    /// mode's own table.
+    async fn handle_status_keys(
+        &mut self,
+        key: KeyEvent,
+        tx: &tokio::sync::mpsc::Sender<Action>,
+    ) -> bool {
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            return false;
+        }
+        if !matches!(
+            self.mode,
+            Mode::Timeline | Mode::StatusDetail(_) | Mode::Profile(_) | Mode::Search(_)
+        ) {
+            return false;
+        }
+        let in_profile = matches!(self.mode, Mode::Profile(_));
+        match key.code {
+            KeyCode::Char('c') => {
+                self.push_mode(Mode::Compose(ComposeState::blank(self.max_chars)));
+            }
+            KeyCode::Char('r') => {
+                if let Some(target) = self.current_target().cloned() {
+                    let reply = reply_context_from(&target, 80);
+                    let vis = api_to_state_vis(target.visibility);
+                    self.push_mode(Mode::Compose(ComposeState::reply(
+                        reply,
+                        vis,
+                        self.max_chars,
+                    )));
+                }
+            }
+            KeyCode::Char('q') => {
+                if let Some(target) = self.current_target().cloned() {
+                    let quote = quote_context_from(&target, 80);
+                    self.push_mode(Mode::Compose(ComposeState::quote(quote, self.max_chars)));
+                }
+            }
+            KeyCode::Char('d') => {
+                if let Some(id) = self.selected_own_status_id() {
+                    self.push_mode(Mode::DeleteConfirm(id));
+                }
+            }
+            KeyCode::Char('u') => {
+                if let Some(acc) = self.current_target().map(|t| t.account.clone()) {
+                    self.open_profile(acc, tx).await;
+                }
+            }
+            // `Q` opens the quoted post of the selected status. A
+            // dedicated key (vs. reusing `l` / `Enter`) keeps "open
+            // outer post" and "open quoted post" unambiguous.
+            KeyCode::Char('Q') => {
+                if let Some(quoted) = self.selected_quoted_status() {
+                    self.open_detail(quoted, tx).await;
+                }
+            }
+            KeyCode::Char('o') if !in_profile => {
+                if let Some(url) = self.current_target_url() {
+                    match open::that_detached(&url) {
+                        Ok(()) => self.push_toast(ToastLevel::Info, "opened in browser".into()),
+                        Err(e) => {
+                            self.push_toast(
+                                ToastLevel::Error,
+                                format!("couldn't open browser · {e}"),
+                            );
+                        }
+                    }
+                }
+            }
+            KeyCode::Char('y') => {
+                if let Some(url) = self.current_target_url() {
+                    match crate::util::clipboard::copy(&url) {
+                        Ok(()) => self.push_toast(ToastLevel::Info, "link copied".into()),
+                        Err(e) => self.push_toast(ToastLevel::Error, format!("copy failed · {e}")),
+                    }
+                }
+            }
+            _ => return false,
+        }
+        true
     }
 
-    /// Build a ComposeState pre-filled to quote the currently
-    /// selected status (Mastodon 4.5 native quote). `q` on a boost
-    /// quotes the inner post, matching the convention used by
-    /// favourite / reblog.
-    fn compose_quote_for_selection(&self) -> Option<ComposeState> {
-        let target = self.selected_target_status()?;
-        let quote = quote_context_from(target, 80);
-        Some(ComposeState::quote(quote, self.max_chars))
+    /// Push a profile page for `acc` and kick off its fetches.
+    async fn open_profile(&mut self, acc: Account, tx: &tokio::sync::mpsc::Sender<Action>) {
+        let id = acc.id.clone();
+        self.push_mode(Mode::Profile(ProfileScreen::new(acc, false)));
+        let _ = tx
+            .send(Action::LoadProfile {
+                id: id.clone(),
+                max_id: None,
+            })
+            .await;
+        let _ = tx.send(Action::LoadRelationship(id)).await;
+    }
+
+    /// Push a thread page for `focal` and request its context.
+    async fn open_detail(&mut self, focal: Status, tx: &tokio::sync::mpsc::Sender<Action>) {
+        let detail = DetailState::new(focal);
+        let id = detail.focal_id().clone();
+        self.push_mode(Mode::StatusDetail(detail));
+        let _ = tx.send(Action::OpenStatus(id)).await;
     }
 
     /// Build a fresh DetailState seeded with the focal post (the inner
@@ -802,7 +875,9 @@ impl App {
         Some(DetailState::new(target.clone()))
     }
 
-    /// Read-only sibling of `selected_target_status_mut`.
+    /// Read-only sibling of `selected_target_status_mut`. Timeline
+    /// tabs only — see [`Self::current_target`] for the mode-aware
+    /// version.
     fn selected_target_status(&self) -> Option<&Status> {
         let kind = self.active;
         let idx = self.screens.get(&kind)?.selected;
@@ -810,18 +885,42 @@ impl App {
         Some(outer.reblog.as_deref().unwrap_or(outer))
     }
 
+    /// The status the cursor points at in whatever mode the user is
+    /// in — inner post for boosts. Covers the four timeline tabs
+    /// (notifications resolve to their attached status), the thread
+    /// page and the profile page.
+    fn current_target(&self) -> Option<&Status> {
+        match &self.mode {
+            Mode::Timeline if self.active == TimelineKind::Notifications => {
+                let idx = self
+                    .notifications_screen
+                    .selected_index(&self.notifications)?;
+                let s = self.notifications.get(idx)?.status.as_ref()?;
+                Some(s.reblog.as_deref().unwrap_or(s))
+            }
+            Mode::Timeline => self.selected_target_status(),
+            Mode::StatusDetail(d) => d.selected_target(),
+            Mode::Profile(p) => p.selected_target(),
+            Mode::Search(s) => s.selected_target(),
+            _ => None,
+        }
+    }
+
+    /// Public URL of the current target (falls back to the
+    /// ActivityPub URI, which is also a browser-openable URL for
+    /// Mastodon-family servers).
+    fn current_target_url(&self) -> Option<String> {
+        let t = self.current_target()?;
+        let url = t.url.clone().unwrap_or_else(|| t.uri.clone());
+        (!url.is_empty()).then_some(url)
+    }
+
     /// Status id to target for a deletion *if* it belongs to the
-    /// signed-in user. Same mode coverage as
-    /// [`Self::selected_quoted_status`]. `None` when there's no
-    /// selection, no `me`, or the author doesn't match.
+    /// signed-in user. `None` when there's no selection, no `me`, or
+    /// the author doesn't match.
     fn selected_own_status_id(&self) -> Option<StatusId> {
         let me_id = self.me.as_ref().map(|a| a.id.clone())?;
-        let target: &Status = match &self.mode {
-            Mode::Timeline => self.selected_target_status()?,
-            Mode::StatusDetail(d) => d.selected_target()?,
-            Mode::Profile(p) => p.selected_target()?,
-            _ => return None,
-        };
+        let target = self.current_target()?;
         if target.account.id == me_id {
             Some(target.id.clone())
         } else {
@@ -831,17 +930,15 @@ impl App {
 
     /// If the currently selected post carries a quote payload with a
     /// resolved `quoted_status`, return an owned clone of that quoted
-    /// status. Looks at whichever mode the user is in: timeline,
-    /// status detail, profile. `None` when there's no selection, no
-    /// quote, or the quote's state is not `accepted` (no payload).
+    /// status. `None` when there's no selection, no quote, or the
+    /// quote's state is not `accepted` (no payload).
     fn selected_quoted_status(&self) -> Option<Status> {
-        let target: &Status = match &self.mode {
-            Mode::Timeline => self.selected_target_status()?,
-            Mode::StatusDetail(d) => d.selected_target()?,
-            Mode::Profile(p) => p.selected_target()?,
-            _ => return None,
-        };
-        target.quote.as_ref()?.quoted_status.as_deref().cloned()
+        self.current_target()?
+            .quote
+            .as_ref()?
+            .quoted_status
+            .as_deref()
+            .cloned()
     }
 
     /// Flip the favourite flag on the currently-selected status' inner
@@ -1052,10 +1149,14 @@ impl App {
                 if let Mode::Profile(p) = &mut self.mode {
                     p.on_status_updated(&status);
                 }
+                if let Mode::Search(s) = &mut self.mode {
+                    s.on_status_updated(&status);
+                }
                 for prev in &mut self.back_stack {
                     match prev {
                         Mode::StatusDetail(d) => d.on_status_updated(&status),
                         Mode::Profile(p) => p.on_status_updated(&status),
+                        Mode::Search(s) => s.on_status_updated(&status),
                         _ => {}
                     }
                 }
@@ -1149,6 +1250,9 @@ impl App {
                 if let Mode::Profile(p) = &mut self.mode {
                     p.revert_action(&id, action);
                 }
+                if let Mode::Search(s) = &mut self.mode {
+                    s.revert_action(&id, action);
+                }
                 // Sub-pages stashed in the back-stack also need patching
                 // so the user doesn't see stale optimistic state when
                 // they navigate back.
@@ -1156,22 +1260,77 @@ impl App {
                     match prev {
                         Mode::StatusDetail(d) => d.revert_action(&id, action),
                         Mode::Profile(p) => p.revert_action(&id, action),
+                        Mode::Search(s) => s.revert_action(&id, action),
                         _ => {}
                     }
                 }
             }
             Event::StatusDeleted(id) => {
-                for list in self.timelines.values_mut() {
-                    list.retain(|s| s.id != id);
+                let gone = |s: &Status| s.id == id || s.reblog.as_ref().is_some_and(|r| r.id == id);
+                for (kind, list) in &mut self.timelines {
+                    list.retain(|s| !gone(s));
+                    if let Some(screen) = self.screens.get_mut(kind) {
+                        screen.on_len_changed(list.len());
+                    }
                 }
-                // If we're staring at the deleted post as the focal
-                // of a thread, bounce back — there's nothing useful
-                // to see anymore. Works around any stale detail
-                // state still sitting on the back stack.
-                if let Mode::StatusDetail(d) = &self.mode
-                    && d.focal_id() == &id
-                {
+                self.notifications
+                    .retain(|n| n.status.as_ref().is_none_or(|s| !gone(s)));
+                self.notifications_screen
+                    .on_len_changed(self.notifications.len());
+                // Thread / profile pages — the live one and any
+                // stashed on the back-stack. A thread whose *focal*
+                // was deleted has nothing left to anchor on: drop it
+                // from the stack, and if it's the live page, leave.
+                let mut leave = false;
+                match &mut self.mode {
+                    Mode::StatusDetail(d) => leave = d.on_status_deleted(&id),
+                    Mode::Profile(p) => p.on_status_deleted(&id),
+                    Mode::Search(s) => s.on_status_deleted(&id),
+                    _ => {}
+                }
+                self.back_stack.retain_mut(|prev| match prev {
+                    Mode::StatusDetail(d) => !d.on_status_deleted(&id),
+                    Mode::Profile(p) => {
+                        p.on_status_deleted(&id);
+                        true
+                    }
+                    Mode::Search(s) => {
+                        s.on_status_deleted(&id);
+                        true
+                    }
+                    _ => true,
+                });
+                if leave {
                     self.pop_mode();
+                }
+            }
+            Event::LoadMoreFailed(kind) => {
+                if kind == TimelineKind::Notifications {
+                    self.notifications_screen.on_load_more_failed();
+                } else if let Some(screen) = self.screens.get_mut(&kind) {
+                    screen.on_load_more_failed();
+                }
+            }
+            Event::ProfileLoadFailed(id) => {
+                if let Mode::Profile(p) = &mut self.mode
+                    && p.account_id == id
+                {
+                    p.on_load_failed();
+                }
+                for prev in &mut self.back_stack {
+                    if let Mode::Profile(p) = prev
+                        && p.account_id == id
+                    {
+                        p.on_load_failed();
+                    }
+                }
+            }
+            Event::AccountListLoadFailed { for_id, kind } => {
+                if let Mode::AccountList(l) = &mut self.mode
+                    && l.for_id == for_id
+                    && l.kind == kind
+                {
+                    l.on_load_failed();
                 }
             }
             Event::TimelineStatusAdded { kind, status } => {
@@ -1214,6 +1373,27 @@ impl App {
                 let len = self.notifications.len();
                 self.notifications_screen.on_prepended(1, len);
             }
+            Event::SearchResults { query, results } => {
+                if let Mode::Search(s) = &mut self.mode
+                    && s.query == query
+                {
+                    s.on_results(results);
+                }
+            }
+            Event::SearchStatuses { query, statuses } => {
+                if let Mode::Search(s) = &mut self.mode
+                    && s.query == query
+                {
+                    s.on_statuses(statuses);
+                }
+            }
+            Event::SearchFailed { query } => {
+                if let Mode::Search(s) = &mut self.mode
+                    && s.query == query
+                {
+                    s.on_failed();
+                }
+            }
             Event::Toast { level, message } => {
                 self.push_toast(level, message);
             }
@@ -1242,19 +1422,23 @@ impl App {
         }
     }
 
+    /// 30 s background tick. Nothing to mutate — the redraw it forces
+    /// is what refreshes the relative timestamps (`2h` → `3h`).
     fn on_tick(&mut self) {
-        // Decay toasts (~8 ticks ≈ 4 min; TTL is enforced at render time too).
-        self.toasts.retain_mut(|t| {
-            t.ticks_remaining = t.ticks_remaining.saturating_sub(1);
-            t.ticks_remaining > 0
-        });
+        self.expire_toasts();
+    }
+
+    /// Drop toasts older than [`TOAST_TTL`]. Called from the 1 s toast
+    /// ticker (only armed while toasts exist) and before every render.
+    fn expire_toasts(&mut self) {
+        self.toasts.retain(|t| t.created.elapsed() < TOAST_TTL);
     }
 
     fn push_toast(&mut self, level: ToastLevel, message: String) {
         self.toasts.push(Toast {
             level,
             message,
-            ticks_remaining: (TOAST_TTL_SECS / 4 + 1) as u8,
+            created: Instant::now(),
         });
         while self.toasts.len() > TOAST_LIMIT {
             self.toasts.remove(0);
@@ -1266,6 +1450,9 @@ impl App {
         // last frame. Cheap when nothing arrived; never blocks.
         self.images.drain();
         self.music.drain();
+        self.expire_toasts();
+        // Copied out first: the per-mode arms below hold `&mut self.mode`.
+        let prefs = self.prefs();
 
         let size = frame.area();
 
@@ -1295,6 +1482,20 @@ impl App {
                 self.render_status_line(frame, layout[2]);
                 self.render_delete_confirm(frame, size);
             }
+            Mode::QuitConfirm => {
+                let layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Min(0),
+                        Constraint::Length(1),
+                    ])
+                    .split(size);
+                self.render_tabs(frame, layout[0]);
+                self.render_body(frame, layout[1]);
+                self.render_status_line(frame, layout[2]);
+                self.render_quit_confirm(frame, size);
+            }
             Mode::StatusDetail(state) => {
                 let layout = Layout::default()
                     .direction(Direction::Vertical)
@@ -1310,7 +1511,7 @@ impl App {
                     frame,
                     layout[1],
                     &self.theme,
-                    self.nerd_font,
+                    prefs,
                     &mut self.images,
                     &mut self.music,
                 );
@@ -1331,7 +1532,7 @@ impl App {
                     frame,
                     layout[1],
                     &self.theme,
-                    self.nerd_font,
+                    prefs,
                     &mut self.music,
                     &mut self.images,
                 );
@@ -1340,6 +1541,26 @@ impl App {
                 } else {
                     ProfileScreen::render_modal_header(frame, layout[0], &self.theme);
                 }
+                self.render_status_line(frame, layout[2]);
+            }
+            Mode::Search(state) => {
+                let layout = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([
+                        Constraint::Length(1),
+                        Constraint::Min(0),
+                        Constraint::Length(1),
+                    ])
+                    .split(size);
+                state.render(
+                    frame,
+                    layout[1],
+                    &self.theme,
+                    prefs,
+                    &mut self.music,
+                    &mut self.images,
+                );
+                state.render_modal_header(frame, layout[0], &self.theme);
                 self.render_status_line(frame, layout[2]);
             }
             Mode::AccountList(state) => {
@@ -1368,7 +1589,9 @@ impl App {
                 AccountSwitcherScreen::render_modal_header(frame, layout[0], &self.theme);
                 self.render_status_line(frame, layout[2]);
             }
-            Mode::Timeline => {
+            // The prompt lives in the status row; the body behind it is
+            // whatever timeline tab is active.
+            Mode::Timeline | Mode::SearchPrompt(_) => {
                 let layout = Layout::default()
                     .direction(Direction::Vertical)
                     .constraints([
@@ -1394,6 +1617,8 @@ impl App {
                     | Mode::AccountList(_)
                     | Mode::AccountSwitcher(_)
                     | Mode::DeleteConfirm(_)
+                    | Mode::QuitConfirm
+                    | Mode::Search(_)
             )
         {
             self.render_toasts(frame, size);
@@ -1486,6 +1711,36 @@ impl App {
         frame.render_widget(p, rect);
     }
 
+    /// Centered "Quit mastoot?" confirm. `Enter` / `y` quits,
+    /// `Esc` / `n` stays.
+    fn render_quit_confirm(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let lines = vec![
+            Line::default(),
+            Line::from(Span::styled("  Quit mastoot?  ", self.theme.primary())),
+            Line::from(Span::styled(
+                "  Enter: quit   ·   Esc: stay  ",
+                self.theme.tertiary(),
+            )),
+            Line::default(),
+        ];
+        let w = 40.min(area.width);
+        let h = 6.min(area.height);
+        let rect = Rect {
+            x: area.x + (area.width.saturating_sub(w)) / 2,
+            y: area.y + (area.height.saturating_sub(h)) / 2,
+            width: w,
+            height: h,
+        };
+        frame.render_widget(ratatui::widgets::Clear, rect);
+        let block = ratatui::widgets::Block::new()
+            .borders(ratatui::widgets::Borders::ALL)
+            .border_style(self.theme.tertiary());
+        let p = Paragraph::new(lines)
+            .style(self.theme.primary())
+            .block(block);
+        frame.render_widget(p, rect);
+    }
+
     fn render_tabs(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
         let labels = [
             (Some(TimelineKind::Home), "1 Home"),
@@ -1526,14 +1781,10 @@ impl App {
     }
 
     fn render_body(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let prefs = self.prefs();
         if self.active == TimelineKind::Notifications {
-            self.notifications_screen.render(
-                frame,
-                area,
-                &self.notifications,
-                &self.theme,
-                self.nerd_font,
-            );
+            self.notifications_screen
+                .render(frame, area, &self.notifications, &self.theme, prefs);
             return;
         }
         let empty: Vec<Status> = Vec::new();
@@ -1544,7 +1795,7 @@ impl App {
                 area,
                 items,
                 &self.theme,
-                self.nerd_font,
+                prefs,
                 &mut self.music,
                 &mut self.images,
             );
@@ -1552,6 +1803,22 @@ impl App {
     }
 
     fn render_status_line(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        // Search prompt takes over the whole row: `/ query▏`.
+        if let Mode::SearchPrompt(q) = &self.mode {
+            let hint = "Enter: search   ·   Esc: cancel ";
+            let left_visual = 3 + q.chars().count() + 1;
+            let pad = (area.width as usize).saturating_sub(left_visual + hint.chars().count());
+            let line = Line::from(vec![
+                Span::raw(" "),
+                Span::styled("/ ", self.theme.link()),
+                Span::styled(q.clone(), self.theme.primary()),
+                Span::styled("▏", self.theme.cursor()),
+                Span::raw(" ".repeat(pad)),
+                Span::styled(hint, self.theme.tertiary()),
+            ]);
+            frame.render_widget(Paragraph::new(line), area);
+            return;
+        }
         // The glyph encodes the user-selected live-update mode; the
         // color encodes REST health. Two orthogonal signals, one dot.
         // - ● streaming (full-size, attention value)
@@ -1587,6 +1854,9 @@ impl App {
             Mode::AccountSwitcher(_) => "switch account".to_string(),
             Mode::Compose(_) | Mode::ComposeConfirmDiscard(_) => "compose".to_string(),
             Mode::DeleteConfirm(_) => "delete?".to_string(),
+            Mode::QuitConfirm => "quit?".to_string(),
+            Mode::Search(s) => format!("search \"{}\"", s.query),
+            Mode::SearchPrompt(_) => "search".to_string(),
         };
 
         // Suffix only shows when something is *not* normal. In streaming
@@ -1654,7 +1924,7 @@ impl App {
         let help_lines = vec![
             "mastoot — keys",
             "",
-            "  Esc / Ctrl+C quit",
+            "  Esc           quit (asks first) · Ctrl+C quits at once",
             "  ?             toggle this help",
             "  1 / 2 / 3 / 4 / 5  Home / Local / Federated / Notifications / Profile",
             "  u             open profile of selected post's author",
@@ -1672,9 +1942,12 @@ impl App {
             "  c             new post",
             "  r             reply to selected",
             "  q             quote selected (Mastodon 4.5+ native quote)",
-            "  d             delete selected (only your own posts; Enter / Esc to confirm)",
+            "  d             delete own post (Enter / Esc to confirm)",
             "  l / Enter     open thread (status detail)",
             "  Q             open quoted post (when selected post is a quote)",
+            "  o             open in browser (in profile: followers)",
+            "  y             copy link of selected post",
+            "  /             search accounts · hashtags · posts",
             "  h / Esc       (in detail) back to timeline",
             "  s             reveal / hide CW body for selected post",
             "  D             toggle inter-post density (1 ↔ 2 blank lines)",
@@ -1691,7 +1964,18 @@ impl App {
             "",
             "  (press any key to dismiss)",
         ];
-        let w = 62.min(area.width);
+        // Fit the box to the longest line (+ borders + a little air)
+        // instead of a fixed width, so no entry gets clipped.
+        let longest = help_lines
+            .iter()
+            .map(|l| {
+                l.chars()
+                    .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
+                    .sum::<usize>()
+            })
+            .max()
+            .unwrap_or(0) as u16;
+        let w = (longest + 4).min(area.width);
         let h = (help_lines.len() as u16 + 2).min(area.height);
         let rect = Rect {
             x: area.x + (area.width.saturating_sub(w)) / 2,

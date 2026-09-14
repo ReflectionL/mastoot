@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result, anyhow};
 use base64::Engine as _;
-use rand::Rng;
+use rand::RngExt;
 use secrecy::SecretString;
 use sha2::{Digest, Sha256};
 use url::Url;
@@ -87,10 +87,8 @@ pub async fn login(instance: &str, cfg: &mut Config, no_browser: bool) -> Result
     let authorize_url = authorize.to_string();
     println!("\nOpen the following URL in your browser to authorize mastoot:");
     println!("\n    {authorize_url}\n");
-    if !no_browser {
-        if let Err(e) = open::that(&authorize_url) {
-            tracing::warn!(?e, "failed to open browser automatically");
-        }
+    if !no_browser && let Err(e) = open::that(&authorize_url) {
+        tracing::warn!(?e, "failed to open browser automatically");
     }
 
     // --- 5. Wait for the redirect (blocking read on a oneshot socket). ---
@@ -263,9 +261,9 @@ fn parse_redirect_request(raw: &str) -> (Option<String>, Option<String>, Option<
 fn generate_code_verifier() -> String {
     // RFC 7636: 43..=128 chars from the unreserved set.
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..96)
-        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char)
         .collect()
 }
 
@@ -276,9 +274,9 @@ fn code_challenge_s256(verifier: &str) -> String {
 
 fn random_token(n: usize) -> String {
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..n)
-        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char)
         .collect()
 }
 

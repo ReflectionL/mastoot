@@ -22,7 +22,7 @@ A Mastodon TUI client. Rust + ratatui. macOS first.
 
 ## 2. Tech Stack
 
-- **Language**: Rust (edition 2024, MSRV = 1.82)
+- **Language**: Rust (edition 2024, MSRV = 1.88 — let-chains)
 - **TUI**: ratatui ≥ 0.30 + crossterm
 - **Async runtime**: tokio (full features)
 - **HTTP**: reqwest (rustls-tls only, 禁用 openssl 避免 macOS 链接问题)
@@ -87,8 +87,9 @@ mastoot/
 │   │   └── html.rs             # Mastodon HTML → ratatui Text
 │   ├── state/
 │   │   ├── mod.rs
-│   │   ├── app.rs              # AppState
-│   │   ├── timeline.rs         # TimelineStore（Vec + dedup by id）
+│   │   ├── app.rs              # AppState：me / api_health / 分页 cursor（Arc<Mutex>）
+│   │   ├── timeline.rs         # TimelineKind（数据本体在 ui 层）
+│   │   ├── task.rs             # dispatcher：每个 action 一个 tokio task（JoinSet）
 │   │   └── event.rs            # Action / Event enum
 │   └── ui/
 │       ├── mod.rs
@@ -99,13 +100,20 @@ mastoot/
 │       │   ├── status_detail.rs
 │       │   ├── compose.rs
 │       │   ├── notifications.rs
-│       │   └── profile.rs
+│       │   ├── profile.rs
+│       │   └── search.rs       # `/` 搜索结果（三段 + 标签时间线）
+│       ├── images.rs           # ImageCache（ratatui-image 协议探测 + 异步下载）
 │       └── widgets/
-│           ├── status_card.rs  # 核心组件
+│           ├── status_card.rs  # 核心组件 + RenderPrefs
+│           ├── shortcode.rs    # 自定义 emoji 短码降色
 │           ├── reply_preview.rs
 │           ├── alt_text.rs
 │           ├── media.rs        # 图片/视频占位与实际渲染
 │           └── help.rs
+│   └── util/
+│       ├── emoji.rs            # emoji 宽度归一
+│       ├── time.rs             # 相对 / 绝对时间
+│       └── clipboard.rs        # OSC 52 + pbcopy
 ├── examples/
 │   └── fetch_home.rs           # 阶段 1 验收用
 └── tests/
@@ -158,9 +166,11 @@ default_instance = "mastodon.social"
 name = "frost"       # 或 "ember"
 
 [ui]
-show_relative_time = true
-media_render = "auto"  # auto | images | text_only
+show_relative_time = true   # false → "Jan 15 14:32"
+media_render = "auto"       # auto | images | text_only
 nerd_font = true
+stream_mode = "streaming"   # streaming | polling | off
+# image_protocol = "kitty"  # 强制 kitty | iterm2 | sixel | halfblocks（默认探测）
 ```
 
 OAuth scope: `read write follow`（不申请 `push`，我们不做推送）。
@@ -305,7 +315,7 @@ Theme {
 | Key | Action |
 |-----|--------|
 | `?` | 帮助 |
-| `q` | 退出 |
+| `Esc` | 退出（顶层；有确认弹窗）· `Ctrl+C` 直接退出 |
 | `1`/`2`/`3`/`4` | Home / Local / Federated / Notifications |
 
 **Timeline 内**：
@@ -320,7 +330,7 @@ Theme {
 | `b` | 转发 |
 | `B` | 取消转发 |
 | `c` | 新帖 |
-| `/` | 搜索 |
+| `/` | 搜索（accounts / hashtags / posts；标签可再钻进时间线） |
 | `R` | 强制刷新 |
 | `o` | 在浏览器打开当前帖 |
 | `y` | 复制链接 |
@@ -416,7 +426,7 @@ cargo run --example fetch_home
 
 1. **GitHub repo 名和 URL**：`https://github.com/ReflectionL/mastoot`（User-Agent 和 OAuth `website` 字段已用此值）
 2. **LICENSE**：MIT / Apache-2.0 / dual？
-   - 暂定：dual MIT / Apache-2.0。`LICENSE-MIT` 已就位；后续需要补 `LICENSE-APACHE`
+   - 已定：dual MIT / Apache-2.0。`LICENSE-MIT` + `LICENSE-APACHE` 都已就位
 3. **一个 fallback 终端场景**：如果用户终端既不支持 kitty 也不支持 iTerm2 图片协议，且关闭了半块渲染，媒体怎么显示？我建议显示 `[󰥶 image: {alt}] (press v to view in browser)` 这种纯文本占位
 4. **初次启动流程**：没有 config 和 token 时，直接进 OAuth 向导？还是要求用户先跑 `mastoot login`？我倾向前者，零配置体验更好
    - 暂定：零配置流程。`mastoot run` 无 token 时提示并退出，用户按提示跑 `mastoot login`；Phase 2 会改成自动进 OAuth 向导
@@ -433,6 +443,9 @@ cargo run --example fetch_home
 
 ### Phase 5  多账号 + quote 完整链路  ·  2026-04-18
 
+- 优化第二轮 · 2026-09-14 — `/` 搜索（prompt 行内输入 + accounts / hashtags / posts 结果页 + 标签时间线复用同一 screen）；自定义 emoji 短码 `:x:` 降 tertiary（`widgets/shortcode.rs`）；全局密度 atomic 换成 `status_card::RenderPrefs` 传参；通知摘要跳空行；依赖升级 toml 1 / directories 6 / rand 0.10 / scraper 0.27
+- 全面优化 · 2026-09-13 — 性能：`html::render_with_links` 按 (html, theme) 线程本地缓存；state task 改为每 action 一个 task（`JoinSet`，切账号 `abort_all`），`AppState` 只留 cursor / health（`Arc<Mutex>`），删掉与 UI 重复的 `TimelineStore`；全局共享 `reqwest::Client`（`client::shared_http` / `shared_stream_http`）；冷启动 verify + instance + home 三路并发。正确性：Esc 退出改成 `QuitConfirm` 弹窗；toast 改 `Instant` 计时 + 1s ticker；SSE 加 90s read timeout + 关掉 eventsource 内层重试；LoadMore 空页标 `exhausted`、失败 `LoadMoreFailed` 解锁；`StatusDeleted` 传播到 detail / profile / notifications / back_stack；polling 也拉 notifications；`<p>` 段落之间补回 1 空行（之前实际是 0）。功能：`o` 浏览器打开、`y` 复制链接（OSC 52 + pbcopy）、reply 提示行 `↪ replying to @…`、投票条、链接卡片一行、HTML 补 ul/ol/li/blockquote/pre/code/h1-6/strong/em/del/u；config 接线 `media_render` / `show_relative_time` / 新 `image_protocol`。结构：`app.rs` 跨 Mode 状态键（c/r/q/d/u/Q/o/y）统一到 `handle_status_keys`；`emoji::normalize` 返回 `Cow`；删重复 `wrap_text`；去掉 `futures-util`。测试：client 本地 mock server 4 条（429 退避 / Link 分页 / bearer+query / 错误映射）；CI 加 MSRV 1.88 job；README 重写；补 `LICENSE-APACHE`
+- Emoji 宽度归一 · 2026-05-23 — 新 `util::emoji::normalize`（unicode-properties + unicode-segmentation）按 grapheme cluster 给 VS16 / keycap underwidth 类 emoji 尾部补空格凑到 2 cell；接到 `api/html.rs::push_text` + status_card / notification_card / profile / account_list 所有 display name / handle / CW / alt / 引用 header / Apple Music 卡片标题艺人；textarea 不动（光标/字数耦合 char-width）；ZWJ/国旗 overwidth 类暂未修
 - Splash · 2026-04-20 — 冷启动 `App.splash=true` 时只画居中一行 `mastoot.`（secondary 色）；`handle_key` 在 Ctrl+C 之后直接 `return true` 吞所有键；`handle_event` 命中 `TimelineUpdated{Home}` 或 `ApiHealthChanged(非 Healthy)` 时 `splash=false`——成功 path 无缝切到填好的 Home，失败 path 也不卡死
 
 用户侧三个请求：(1) 多账号切换，(2) Fedibird-style `RE: <url>` 从 quote 帖正文剥掉

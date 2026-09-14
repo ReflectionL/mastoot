@@ -3,35 +3,51 @@
 //! The UI never awaits on network calls directly. It sends [`Action`]s
 //! over an mpsc channel and consumes [`Event`]s off another. This keeps
 //! the render loop snappy and localizes the client's lifetime.
+//!
+//! **Concurrency model.** The dispatcher loop itself never awaits a
+//! network call. Every action that talks to the server is spawned as
+//! its own tokio task (the client is `Clone`, the bookkeeping state is
+//! behind a mutex), so a slow `/context` fetch can't hold up a
+//! favourite, a `LoadMore`, or the polling tick behind it. The two
+//! actions that mutate the dispatcher's own state — [`Action::SetStreamMode`]
+//! and [`Action::SwitchAccount`] — run inline; an account switch also
+//! aborts every in-flight task so a late reply from the old session
+//! can't land in the new one.
 
 use std::time::Duration;
 
-use futures_util::StreamExt;
+use futures::StreamExt;
 use tokio::sync::mpsc;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{debug, warn};
 
 use crate::api::endpoints::{
     AccountListParams, AccountStatusesParams, NotificationParams, StatusDraft, TimelineParams,
 };
 use crate::api::error::ApiErrorCategory;
-use crate::api::models::{Status, StatusId, Visibility as ApiVisibility};
+use crate::api::models::{AccountId, Status, StatusId, Visibility as ApiVisibility};
 use crate::api::streaming::{StreamEvent, UserStream};
 use crate::api::{ApiError, MastodonClient};
-use crate::state::app::AppState;
+use crate::state::app::{AppState, Shared, lock};
 use crate::state::event::{
     AccountListKind, Action, ApiHealth, Event, FailedAction, StreamMode, StreamState, ToastLevel,
     Visibility,
 };
 use crate::state::timeline::TimelineKind;
 
-const ACTION_CAP: usize = 64;
-const EVENT_CAP: usize = 256;
+/// Action queue depth. Generous: the dispatcher drains it instantly
+/// (every action is spawned), so the UI's `send().await` only ever
+/// blocks if the tokio runtime itself is wedged.
+const ACTION_CAP: usize = 256;
+const EVENT_CAP: usize = 1024;
 const PAGE_SIZE: u32 = 40;
 /// Reconnect backoff grows 1 → 2 → 4 → 8 → 16 → 30 (capped). Resets to
 /// 1 on a successful open.
 const STREAM_BACKOFF_MIN: Duration = Duration::from_secs(1);
 const STREAM_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// Polling cadence. Matches the background tick (toast decay / relative
+/// timestamps) — no point polling faster than the UI can paint.
+const POLLING_PERIOD: Duration = Duration::from_secs(30);
 
 /// Handle returned by [`spawn`]. The UI holds this for the lifetime of
 /// the TUI; drop it to signal shutdown.
@@ -53,8 +69,7 @@ pub fn spawn(client: MastodonClient) -> Handle {
     let (action_tx, action_rx) = mpsc::channel::<Action>(ACTION_CAP);
     let (event_tx, event_rx) = mpsc::channel::<Event>(EVENT_CAP);
     // Inner action-sender clone: used by sub-tasks (polling loop) to
-    // re-enter the main loop's match arms via Action. Never handed to
-    // the UI.
+    // re-enter the dispatcher via Action. Never handed to the UI.
     let internal_tx = action_tx.clone();
     let task = tokio::spawn(run(client, action_rx, internal_tx, event_tx));
     Handle {
@@ -62,6 +77,15 @@ pub fn spawn(client: MastodonClient) -> Handle {
         events: event_rx,
         task,
     }
+}
+
+/// Everything an action task needs, bundled so the spawn sites stay
+/// one-liners.
+#[derive(Clone)]
+struct Ctx {
+    client: MastodonClient,
+    state: Shared,
+    events: mpsc::Sender<Event>,
 }
 
 /// Holder for whichever live-update task is currently running.
@@ -82,13 +106,7 @@ impl LiveUpdateSlot {
     /// Swap to `new`. Aborts the previous task, spawns whatever the new
     /// mode requires, and broadcasts a fresh [`StreamState`] so the UI
     /// dot updates immediately.
-    async fn set(
-        &mut self,
-        new: StreamMode,
-        client: &MastodonClient,
-        actions: &mpsc::Sender<Action>,
-        events: &mpsc::Sender<Event>,
-    ) {
+    async fn set(&mut self, new: StreamMode, ctx: &Ctx, actions: &mpsc::Sender<Action>) {
         if new == self.mode && self.handle.is_some() {
             return;
         }
@@ -97,8 +115,8 @@ impl LiveUpdateSlot {
         }
         self.mode = new;
         self.handle = match new {
-            StreamMode::Streaming if client.token().is_some() => {
-                Some(tokio::spawn(streaming_loop(client.clone(), events.clone())))
+            StreamMode::Streaming if ctx.client.token().is_some() => {
+                Some(tokio::spawn(streaming_loop(ctx.clone())))
             }
             StreamMode::Polling => {
                 Some(tokio::spawn(polling_loop(actions.clone(), POLLING_PERIOD)))
@@ -106,9 +124,7 @@ impl LiveUpdateSlot {
             // Streaming-but-no-token collapses to Off — Mastodon rejects
             // anonymous streams, so there's nothing to spawn.
             StreamMode::Streaming | StreamMode::Off => {
-                let _ = events
-                    .send(Event::StreamState(StreamState::Disconnected))
-                    .await;
+                send(&ctx.events, Event::StreamState(StreamState::Disconnected)).await;
                 None
             }
         };
@@ -121,242 +137,253 @@ impl LiveUpdateSlot {
     }
 }
 
-/// Polling cadence. Matches the background tick (toast decay / relative
-/// timestamps) — no point polling faster than the UI can paint.
-const POLLING_PERIOD: Duration = Duration::from_secs(30);
-
 async fn run(
     client: MastodonClient,
     mut actions: mpsc::Receiver<Action>,
     actions_tx: mpsc::Sender<Action>,
     events: mpsc::Sender<Event>,
 ) {
-    let mut client = client;
-    let mut state = AppState::new();
+    let mut ctx = Ctx {
+        client,
+        state: AppState::shared(),
+        events,
+    };
     // Live-update slot — starts idle. The UI sends SetStreamMode as
     // its first action so the initial mode comes from config, not a
     // hardcoded default.
     let mut live = LiveUpdateSlot::idle();
+    // Every network-bound action lives here. Reaped as they finish;
+    // aborted wholesale on account switch / shutdown.
+    let mut inflight: JoinSet<()> = JoinSet::new();
 
-    bootstrap_session(&client, &mut state, &events).await;
+    inflight.spawn(bootstrap_session(ctx.clone()));
 
-    while let Some(action) = actions.recv().await {
-        match action {
-            Action::LoadTimeline(kind) | Action::Refresh(kind) => {
+    loop {
+        tokio::select! {
+            maybe = actions.recv() => {
+                let Some(action) = maybe else { break };
+                match action {
+                    Action::Quit => break,
+                    Action::SetStreamMode(mode) => {
+                        live.set(mode, &ctx, &actions_tx).await;
+                    }
+                    Action::SwitchAccount { instance, handle, token } => {
+                        let new_client = match MastodonClient::new(&instance, token) {
+                            Ok(c) => c,
+                            Err(e) => {
+                                warn!(?e, %handle, "failed to build client for account switch");
+                                toast(&ctx.events, ToastLevel::Error, format!("switch failed · {}", e.terse())).await;
+                                continue;
+                            }
+                        };
+                        // Tear down everything that holds the outgoing
+                        // client: the live-update task and every
+                        // in-flight action. A late reply from the old
+                        // account must never land in the new session.
+                        live.shutdown();
+                        inflight.abort_all();
+                        ctx.client = new_client;
+                        *lock(&ctx.state) = AppState::new();
+
+                        send(&ctx.events, Event::AccountSwitched { handle: handle.clone() }).await;
+                        toast(&ctx.events, ToastLevel::Info, format!("switched to {handle}")).await;
+
+                        inflight.spawn(bootstrap_session(ctx.clone()));
+                        // Re-arm live updates with whatever mode the UI
+                        // was last running in.
+                        let mode = live.mode;
+                        live.set(mode, &ctx, &actions_tx).await;
+                        // Kick a fresh Home fetch so the timeline paints
+                        // immediately — UI already cleared its caches on
+                        // the AccountSwitched event.
+                        inflight.spawn(handle_action(ctx.clone(), Action::LoadTimeline(TimelineKind::Home)));
+                    }
+                    other => {
+                        inflight.spawn(handle_action(ctx.clone(), other));
+                    }
+                }
+            }
+            Some(finished) = inflight.join_next(), if !inflight.is_empty() => {
+                if let Err(e) = finished
+                    && e.is_panic()
+                {
+                    warn!(?e, "action task panicked");
+                }
+            }
+        }
+    }
+    inflight.abort_all();
+    live.shutdown();
+    debug!("state task exiting");
+}
+
+/// One action, one task. Everything here runs concurrently with every
+/// other action; shared bookkeeping goes through `ctx.state`.
+async fn handle_action(ctx: Ctx, action: Action) {
+    match action {
+        Action::LoadTimeline(kind) | Action::Refresh(kind) => {
+            if matches!(kind, TimelineKind::Notifications) {
+                lock(&ctx.state).notifications_oldest = None;
+            }
+            load_timeline(&ctx, kind, None, false).await;
+        }
+        Action::LoadMore(kind) => {
+            let max_id = {
+                let st = lock(&ctx.state);
                 if matches!(kind, TimelineKind::Notifications) {
-                    state.notifications_oldest = None;
-                }
-                load_timeline(&client, &mut state, &events, kind, None, false).await;
-            }
-            Action::LoadMore(kind) => {
-                let max_id = if matches!(kind, TimelineKind::Notifications) {
-                    state.notifications_oldest.clone().map(|id| id.0)
+                    st.notifications_oldest.clone().map(|id| id.0)
                 } else {
-                    state
-                        .timeline(kind)
-                        .and_then(|t| t.oldest_id().cloned())
+                    st.cursors(kind)
+                        .and_then(|c| c.oldest.clone())
                         .map(|id| id.0)
-                };
-                load_timeline(&client, &mut state, &events, kind, max_id, true).await;
-            }
-            Action::Favourite(id) => {
-                let r = client.favourite(&id).await;
-                status_action(&events, &mut state, id, FailedAction::Favourite, r).await;
-            }
-            Action::Unfavourite(id) => {
-                let r = client.unfavourite(&id).await;
-                status_action(&events, &mut state, id, FailedAction::Unfavourite, r).await;
-            }
-            Action::Reblog(id) => {
-                let r = client.reblog(&id).await;
-                status_action(&events, &mut state, id, FailedAction::Reblog, r).await;
-            }
-            Action::Unreblog(id) => {
-                let r = client.unreblog(&id).await;
-                status_action(&events, &mut state, id, FailedAction::Unreblog, r).await;
-            }
-            Action::Bookmark(id) => {
-                let r = client.bookmark(&id).await;
-                status_action(&events, &mut state, id, FailedAction::Bookmark, r).await;
-            }
-            Action::DeleteStatus(id) => match client.delete_status(&id).await {
-                Ok(_) => {
-                    send(&events, Event::StatusDeleted(id)).await;
-                    send(
-                        &events,
-                        Event::Toast {
-                            level: ToastLevel::Info,
-                            message: "deleted".into(),
-                        },
-                    )
-                    .await;
-                    note_api_ok(&events, &mut state).await;
                 }
-                Err(e) => {
-                    report_api_error(&events, &mut state, "delete", &e).await;
-                }
-            },
-            Action::Unbookmark(id) => {
-                let r = client.unbookmark(&id).await;
-                status_action(&events, &mut state, id, FailedAction::Unbookmark, r).await;
+            };
+            load_timeline(&ctx, kind, max_id, true).await;
+        }
+        Action::FetchNewer(kind) => fetch_newer(&ctx, kind).await,
+        Action::Favourite(id) => {
+            let r = ctx.client.favourite(&id).await;
+            status_action(&ctx, id, FailedAction::Favourite, r).await;
+        }
+        Action::Unfavourite(id) => {
+            let r = ctx.client.unfavourite(&id).await;
+            status_action(&ctx, id, FailedAction::Unfavourite, r).await;
+        }
+        Action::Reblog(id) => {
+            let r = ctx.client.reblog(&id).await;
+            status_action(&ctx, id, FailedAction::Reblog, r).await;
+        }
+        Action::Unreblog(id) => {
+            let r = ctx.client.unreblog(&id).await;
+            status_action(&ctx, id, FailedAction::Unreblog, r).await;
+        }
+        Action::Bookmark(id) => {
+            let r = ctx.client.bookmark(&id).await;
+            status_action(&ctx, id, FailedAction::Bookmark, r).await;
+        }
+        Action::Unbookmark(id) => {
+            let r = ctx.client.unbookmark(&id).await;
+            status_action(&ctx, id, FailedAction::Unbookmark, r).await;
+        }
+        Action::DeleteStatus(id) => match ctx.client.delete_status(&id).await {
+            Ok(_) => {
+                send(&ctx.events, Event::StatusDeleted(id)).await;
+                toast(&ctx.events, ToastLevel::Info, "deleted".into()).await;
+                note_api_ok(&ctx).await;
             }
-            Action::Compose {
+            Err(e) => report_api_error(&ctx, "delete", &e).await,
+        },
+        Action::Compose {
+            text,
+            in_reply_to_id,
+            quote_id,
+            content_warning,
+            sensitive,
+            visibility,
+        } => {
+            let posted = post_status(
+                &ctx,
                 text,
                 in_reply_to_id,
                 quote_id,
                 content_warning,
                 sensitive,
                 visibility,
-            } => {
-                let posted = post_status(
-                    &client,
-                    &mut state,
-                    &events,
-                    text,
-                    in_reply_to_id,
-                    quote_id,
-                    content_warning,
-                    sensitive,
-                    visibility,
-                )
-                .await;
-                if posted {
-                    // Pull a fresh home timeline so the just-posted
-                    // status shows up immediately.
-                    load_timeline(
-                        &client,
-                        &mut state,
-                        &events,
-                        TimelineKind::Home,
-                        None,
-                        false,
-                    )
-                    .await;
+            )
+            .await;
+            if posted {
+                // Pull a fresh home timeline so the just-posted
+                // status shows up immediately.
+                load_timeline(&ctx, TimelineKind::Home, None, false).await;
+            }
+        }
+        Action::LoadProfile { id, max_id } => load_profile(&ctx, id, max_id).await,
+        Action::LoadRelationship(id) => load_relationship(&ctx, id).await,
+        Action::Follow(id) => follow_action(&ctx, id, true).await,
+        Action::Unfollow(id) => follow_action(&ctx, id, false).await,
+        Action::LoadAccountList { id, kind, max_id } => {
+            load_account_list(&ctx, id, kind, max_id).await;
+        }
+        Action::Search { query } => {
+            let params = crate::api::endpoints::SearchParams {
+                q: &query,
+                kind: None,
+                resolve: true,
+                following: false,
+                limit: Some(20),
+            };
+            match ctx.client.search(&params).await {
+                Ok(results) => {
+                    send(&ctx.events, Event::SearchResults { query, results }).await;
+                    note_api_ok(&ctx).await;
+                }
+                Err(e) => {
+                    send(&ctx.events, Event::SearchFailed { query }).await;
+                    report_api_error(&ctx, "search", &e).await;
                 }
             }
-            Action::LoadProfile { id, max_id } => {
-                load_profile(&client, &mut state, &events, id, max_id).await;
-            }
-            Action::LoadRelationship(id) => {
-                load_relationship(&client, &mut state, &events, id).await;
-            }
-            Action::Follow(id) => {
-                follow_action(&client, &mut state, &events, id, true).await;
-            }
-            Action::Unfollow(id) => {
-                follow_action(&client, &mut state, &events, id, false).await;
-            }
-            Action::LoadAccountList { id, kind, max_id } => {
-                load_account_list(&client, &mut state, &events, id, kind, max_id).await;
-            }
-            Action::OpenStatus(id) => match client.status_context(&id).await {
-                Ok(ctx) => {
+        }
+        Action::SearchTag { name } => {
+            let params = TimelineParams {
+                limit: Some(PAGE_SIZE),
+                ..Default::default()
+            };
+            let query = format!("#{name}");
+            match ctx.client.tag_timeline(&name, &params).await {
+                Ok(page) => {
                     send(
-                        &events,
-                        Event::StatusContext {
-                            focal_id: id,
-                            ancestors: ctx.ancestors,
-                            descendants: ctx.descendants,
+                        &ctx.events,
+                        Event::SearchStatuses {
+                            query,
+                            statuses: page.items,
                         },
                     )
                     .await;
-                    note_api_ok(&events, &mut state).await;
+                    note_api_ok(&ctx).await;
                 }
                 Err(e) => {
-                    report_api_error(&events, &mut state, "thread", &e).await;
+                    send(&ctx.events, Event::SearchFailed { query }).await;
+                    report_api_error(&ctx, "hashtag", &e).await;
                 }
-            },
-            Action::SetStreamMode(mode) => {
-                live.set(mode, &client, &actions_tx, &events).await;
             }
-            Action::SwitchAccount {
-                instance,
-                handle,
-                token,
-            } => {
-                let new_client = match MastodonClient::new(&instance, token) {
-                    Ok(c) => c,
-                    Err(e) => {
-                        warn!(?e, %handle, "failed to build client for account switch");
-                        send(
-                            &events,
-                            Event::Toast {
-                                level: ToastLevel::Error,
-                                message: format!("switch failed · {}", e.terse()),
-                            },
-                        )
-                        .await;
-                        continue;
-                    }
-                };
-                // Tear down the live-update task first — it holds a
-                // cloned handle of the outgoing client.
-                live.shutdown();
-                client = new_client;
-                // Reset server-derived state. Everything else (back_stack,
-                // profile caches, toast queue) lives UI-side and the
-                // AccountSwitched event tells the UI to wipe there too.
-                state = AppState::new();
-
-                send(
-                    &events,
-                    Event::AccountSwitched {
-                        handle: handle.clone(),
-                    },
-                )
-                .await;
-                send(
-                    &events,
-                    Event::Toast {
-                        level: ToastLevel::Info,
-                        message: format!("switched to {handle}"),
-                    },
-                )
-                .await;
-
-                bootstrap_session(&client, &mut state, &events).await;
-
-                // Re-arm live updates with whatever mode the UI was
-                // last running in. If the UI hadn't sent SetStreamMode
-                // yet, this remains Off.
-                let mode = live.mode;
-                live.set(mode, &client, &actions_tx, &events).await;
-
-                // Kick a fresh Home fetch so the timeline paints
-                // immediately — UI already cleared its caches on the
-                // AccountSwitched event.
-                load_timeline(
-                    &client,
-                    &mut state,
-                    &events,
-                    TimelineKind::Home,
-                    None,
-                    false,
-                )
-                .await;
-            }
-            Action::FetchNewer(kind) => {
-                fetch_newer(&client, &mut state, &events, kind).await;
-            }
-            Action::Quit => break,
         }
+        Action::OpenStatus(id) => match ctx.client.status_context(&id).await {
+            Ok(c) => {
+                send(
+                    &ctx.events,
+                    Event::StatusContext {
+                        focal_id: id,
+                        ancestors: c.ancestors,
+                        descendants: c.descendants,
+                    },
+                )
+                .await;
+                note_api_ok(&ctx).await;
+            }
+            Err(e) => report_api_error(&ctx, "thread", &e).await,
+        },
+        // Handled inline by the dispatcher; never reaches here.
+        Action::SetStreamMode(_) | Action::SwitchAccount { .. } | Action::Quit => {}
     }
-    live.shutdown();
-    debug!("state task exiting");
 }
 
 /// Called by the polling loop every [`POLLING_PERIOD`] seconds. Fetches
-/// any statuses newer than the current store's newest_id and prepends
-/// each one via `TimelineStatusAdded` — same event SSE updates emit.
-async fn fetch_newer(
-    client: &MastodonClient,
-    state: &mut AppState,
-    events: &mpsc::Sender<Event>,
-    kind: TimelineKind,
-) {
-    let since_id = state
-        .timeline(kind)
-        .and_then(|t| t.newest_id().cloned())
+/// anything newer than the cursor and prepends each item via the same
+/// events SSE updates emit.
+async fn fetch_newer(ctx: &Ctx, kind: TimelineKind) {
+    match kind {
+        TimelineKind::Home | TimelineKind::Local | TimelineKind::Federated => {
+            fetch_newer_statuses(ctx, kind).await;
+        }
+        TimelineKind::Notifications => fetch_newer_notifications(ctx).await,
+        _ => {}
+    }
+}
+
+async fn fetch_newer_statuses(ctx: &Ctx, kind: TimelineKind) {
+    let since_id = lock(&ctx.state)
+        .cursors(kind)
+        .and_then(|c| c.newest.clone())
         .map(|id| id.0);
     // No cursor yet (empty timeline) — wait for the first full load.
     let Some(since_id) = since_id else {
@@ -369,31 +396,50 @@ async fn fetch_newer(
         ..Default::default()
     };
     let result = match kind {
-        TimelineKind::Home => client.home_timeline(&params).await,
-        TimelineKind::Local | TimelineKind::Federated => client.public_timeline(&params).await,
-        _ => return, // polling other kinds not supported for now
+        TimelineKind::Home => ctx.client.home_timeline(&params).await,
+        _ => ctx.client.public_timeline(&params).await,
     };
     match result {
         Ok(page) => {
-            note_api_ok(events, state).await;
-            let store = state.timeline_mut(kind);
+            note_api_ok(ctx).await;
+            if let Some(first) = page.items.first() {
+                lock(&ctx.state).note_page(kind, Some(first.id.clone()), None);
+            }
             // Mastodon returns newest-first; iterate reversed so the
             // oldest-new item arrives first and the final prepend sits
-            // at the top.
+            // at the top. The UI dedups by id.
             for status in page.items.into_iter().rev() {
-                if store.update(status.clone()) {
-                    continue; // already had it
-                }
-                store.prepend(vec![status.clone()]);
-                let _ = events
-                    .send(Event::TimelineStatusAdded { kind, status })
-                    .await;
+                send(&ctx.events, Event::TimelineStatusAdded { kind, status }).await;
             }
         }
         Err(e) => {
             // Polling failures are quiet: the dot dims, no toast spam.
-            note_api_error(events, state, &e).await;
+            note_api_error(ctx, &e).await;
         }
+    }
+}
+
+async fn fetch_newer_notifications(ctx: &Ctx) {
+    let since_id = lock(&ctx.state).notifications_newest.clone().map(|id| id.0);
+    let Some(since_id) = since_id else {
+        return;
+    };
+    let params = NotificationParams {
+        since_id: Some(since_id),
+        limit: Some(PAGE_SIZE),
+        ..Default::default()
+    };
+    match ctx.client.notifications(&params).await {
+        Ok(page) => {
+            note_api_ok(ctx).await;
+            if let Some(first) = page.items.first() {
+                lock(&ctx.state).notifications_newest = Some(first.id.clone());
+            }
+            for n in page.items.into_iter().rev() {
+                send(&ctx.events, Event::NotificationReceived(n)).await;
+            }
+        }
+        Err(e) => note_api_error(ctx, &e).await,
     }
 }
 
@@ -407,13 +453,11 @@ async fn polling_loop(actions: mpsc::Sender<Action>, period: Duration) {
     ticker.tick().await;
     loop {
         ticker.tick().await;
-        if actions
-            .send(Action::FetchNewer(TimelineKind::Home))
-            .await
-            .is_err()
-        {
-            // main loop is gone — bail
-            break;
+        for kind in [TimelineKind::Home, TimelineKind::Notifications] {
+            if actions.send(Action::FetchNewer(kind)).await.is_err() {
+                // dispatcher is gone — bail
+                return;
+            }
         }
     }
 }
@@ -427,20 +471,16 @@ async fn polling_loop(actions: mpsc::Sender<Action>, period: Duration) {
 /// separate signal (the REST API might be fine while streaming is
 /// down, e.g. behind a proxy that buffers) — UI renders them as a
 /// secondary status-bar label.
-async fn streaming_loop(client: MastodonClient, events: mpsc::Sender<Event>) {
+async fn streaming_loop(ctx: Ctx) {
     let mut backoff = STREAM_BACKOFF_MIN;
     loop {
-        let _ = events
-            .send(Event::StreamState(StreamState::Connecting))
-            .await;
-        match UserStream::open(&client).await {
+        send(&ctx.events, Event::StreamState(StreamState::Connecting)).await;
+        match UserStream::open(&ctx.client).await {
             Ok(mut s) => {
-                let _ = events
-                    .send(Event::StreamState(StreamState::Connected))
-                    .await;
+                send(&ctx.events, Event::StreamState(StreamState::Connected)).await;
                 backoff = STREAM_BACKOFF_MIN;
                 while let Some(ev) = s.next().await {
-                    if !dispatch_stream_event(&events, ev).await {
+                    if !dispatch_stream_event(&ctx, ev).await {
                         // Disconnect sentinel — bail out to the reconnect path.
                         break;
                     }
@@ -451,53 +491,50 @@ async fn streaming_loop(client: MastodonClient, events: mpsc::Sender<Event>) {
                 warn!(?e, "failed to open user stream");
             }
         }
-        let _ = events
-            .send(Event::StreamState(StreamState::Reconnecting))
-            .await;
+        send(&ctx.events, Event::StreamState(StreamState::Reconnecting)).await;
         tokio::time::sleep(backoff).await;
         backoff = (backoff * 2).min(STREAM_BACKOFF_MAX);
     }
 }
 
-/// Translate a single [`StreamEvent`] into the right UI event(s).
+/// Translate a single [`StreamEvent`] into the right UI event(s) and
+/// keep the `since_id` cursors current so a later switch to polling
+/// mode doesn't refetch what the stream already delivered.
 /// Returns `false` on Disconnect (signals the caller to reconnect);
 /// otherwise `true` regardless of whether the event was emitted.
-async fn dispatch_stream_event(events: &mpsc::Sender<Event>, ev: StreamEvent) -> bool {
+async fn dispatch_stream_event(ctx: &Ctx, ev: StreamEvent) -> bool {
     match ev {
         StreamEvent::Update(status) => {
-            let _ = events
-                .send(Event::TimelineStatusAdded {
+            lock(&ctx.state).note_page(TimelineKind::Home, Some(status.id.clone()), None);
+            send(
+                &ctx.events,
+                Event::TimelineStatusAdded {
                     kind: TimelineKind::Home,
                     status: *status,
-                })
-                .await;
+                },
+            )
+            .await;
         }
         StreamEvent::Delete(id) => {
-            let _ = events.send(Event::StatusDeleted(id)).await;
+            send(&ctx.events, Event::StatusDeleted(id)).await;
         }
         StreamEvent::Notification(n) => {
-            let _ = events.send(Event::NotificationReceived(*n)).await;
+            lock(&ctx.state).notifications_newest = Some(n.id.clone());
+            send(&ctx.events, Event::NotificationReceived(*n)).await;
         }
         StreamEvent::StatusUpdate(status) => {
-            let _ = events.send(Event::StatusUpdated(*status)).await;
+            send(&ctx.events, Event::StatusUpdated(*status)).await;
         }
         StreamEvent::Disconnect => return false,
-        // Phase 4 · B scope: ignore filters / announcements /
-        // conversations / unknown — they're fine to drop for MVP and
-        // can be surfaced later without touching the reconnect loop.
+        // Filters / announcements / conversations / unknown are fine to
+        // drop for now and can be surfaced later without touching the
+        // reconnect loop.
         _ => {}
     }
     true
 }
 
-async fn load_timeline(
-    client: &MastodonClient,
-    state: &mut AppState,
-    events: &mpsc::Sender<Event>,
-    kind: TimelineKind,
-    max_id: Option<String>,
-    appended: bool,
-) {
+async fn load_timeline(ctx: &Ctx, kind: TimelineKind, max_id: Option<String>, appended: bool) {
     let params = TimelineParams {
         max_id,
         limit: Some(PAGE_SIZE),
@@ -505,19 +542,17 @@ async fn load_timeline(
         ..Default::default()
     };
     let result = match kind {
-        TimelineKind::Home => client.home_timeline(&params).await,
-        TimelineKind::Local | TimelineKind::Federated => client.public_timeline(&params).await,
+        TimelineKind::Home => ctx.client.home_timeline(&params).await,
+        TimelineKind::Local | TimelineKind::Federated => ctx.client.public_timeline(&params).await,
         TimelineKind::Notifications => {
-            load_notifications(client, state, events, params.max_id, appended).await;
+            load_notifications(ctx, params.max_id, appended).await;
             return;
         }
         _ => {
-            send(
-                events,
-                Event::Toast {
-                    level: ToastLevel::Info,
-                    message: format!("{kind:?}: coming in phase 3"),
-                },
+            toast(
+                &ctx.events,
+                ToastLevel::Info,
+                format!("{}: not available yet", kind.label()),
             )
             .await;
             return;
@@ -525,14 +560,18 @@ async fn load_timeline(
     };
     match result {
         Ok(page) => {
-            let store = state.timeline_mut(kind);
-            if appended {
-                store.append(page.items.clone());
-            } else {
-                store.replace(page.items.clone());
+            {
+                let mut st = lock(&ctx.state);
+                let oldest = page.items.last().map(|s| s.id.clone());
+                if appended {
+                    st.note_page(kind, None, oldest);
+                } else {
+                    let newest = page.items.first().map(|s| s.id.clone());
+                    st.note_page(kind, newest, oldest);
+                }
             }
             send(
-                events,
+                &ctx.events,
                 Event::TimelineUpdated {
                     kind,
                     statuses: page.items,
@@ -540,96 +579,88 @@ async fn load_timeline(
                 },
             )
             .await;
-            note_api_ok(events, state).await;
+            note_api_ok(ctx).await;
         }
         Err(e) => {
-            let verb = format!("{} timeline", timeline_label(kind));
-            report_api_error(events, state, &verb, &e).await;
+            if appended {
+                send(&ctx.events, Event::LoadMoreFailed(kind)).await;
+            }
+            let verb = format!("{} timeline", kind.label());
+            report_api_error(ctx, &verb, &e).await;
         }
-    }
-}
-
-fn timeline_label(kind: TimelineKind) -> &'static str {
-    match kind {
-        TimelineKind::Home => "home",
-        TimelineKind::Local => "local",
-        TimelineKind::Federated => "federated",
-        TimelineKind::Notifications => "notifications",
-        TimelineKind::Profile => "profile",
-        TimelineKind::Favourites => "favourites",
-        TimelineKind::Bookmarks => "bookmarks",
     }
 }
 
 /// Fetch a page of notifications. The state task tracks only the
-/// oldest-seen id so `LoadMore` can paginate; the full list lives in
-/// the UI layer (notifications aren't shared across screens the way
-/// statuses are, so a separate store on AppState would be dead weight).
-async fn load_notifications(
-    client: &MastodonClient,
-    state: &mut AppState,
-    events: &mpsc::Sender<Event>,
-    max_id: Option<String>,
-    appended: bool,
-) {
+/// newest / oldest ids for pagination; the full list lives in the UI.
+async fn load_notifications(ctx: &Ctx, max_id: Option<String>, appended: bool) {
     let params = NotificationParams {
         max_id,
         limit: Some(PAGE_SIZE),
         ..Default::default()
     };
-    match client.notifications(&params).await {
+    match ctx.client.notifications(&params).await {
         Ok(page) => {
-            if let Some(last) = page.items.last() {
-                state.notifications_oldest = Some(last.id.clone());
+            {
+                let mut st = lock(&ctx.state);
+                if let Some(last) = page.items.last() {
+                    st.notifications_oldest = Some(last.id.clone());
+                }
+                if !appended && let Some(first) = page.items.first() {
+                    st.notifications_newest = Some(first.id.clone());
+                }
             }
             send(
-                events,
+                &ctx.events,
                 Event::NotificationsUpdated {
                     items: page.items,
                     appended,
                 },
             )
             .await;
-            note_api_ok(events, state).await;
+            note_api_ok(ctx).await;
         }
         Err(e) => {
-            report_api_error(events, state, "notifications", &e).await;
+            if appended {
+                send(
+                    &ctx.events,
+                    Event::LoadMoreFailed(TimelineKind::Notifications),
+                )
+                .await;
+            }
+            report_api_error(ctx, "notifications", &e).await;
         }
     }
 }
 
-/// Fetch a profile (account + statuses page). When `max_id` is `Some`
-/// we skip the account refetch — header is already on screen and the
-/// fresh page is what the user is paginating into.
-async fn load_profile(
-    client: &MastodonClient,
-    state: &mut AppState,
-    events: &mpsc::Sender<Event>,
-    id: crate::api::models::AccountId,
-    max_id: Option<String>,
-) {
+/// Fetch a profile (account + statuses page). The two requests run
+/// concurrently on a first load; pagination skips the account refetch
+/// since the header is already on screen.
+async fn load_profile(ctx: &Ctx, id: AccountId, max_id: Option<String>) {
     let appended = max_id.is_some();
-    let account = if appended {
-        // Don't bother refetching on pagination.
-        None
-    } else {
-        match client.account(&id).await {
-            Ok(a) => {
-                note_api_ok(events, state).await;
-                Some(a)
-            }
-            Err(e) => {
-                report_api_error(events, state, "profile", &e).await;
-                return;
-            }
-        }
-    };
     let params = AccountStatusesParams {
         max_id,
         limit: Some(PAGE_SIZE),
         ..Default::default()
     };
-    match client.account_statuses(&id, &params).await {
+    let (account, statuses) = if appended {
+        (Ok(None), ctx.client.account_statuses(&id, &params).await)
+    } else {
+        let (a, s) = tokio::join!(
+            ctx.client.account(&id),
+            ctx.client.account_statuses(&id, &params)
+        );
+        (a.map(Some), s)
+    };
+    let account = match account {
+        Ok(a) => a,
+        Err(e) => {
+            send(&ctx.events, Event::ProfileLoadFailed(id)).await;
+            report_api_error(ctx, "profile", &e).await;
+            return;
+        }
+    };
+    match statuses {
         Ok(page) => {
             // For pagination calls we don't have an Account on hand;
             // synthesize a stub with just the id so the UI can match
@@ -639,7 +670,7 @@ async fn load_profile(
                 ..Default::default()
             });
             send(
-                events,
+                &ctx.events,
                 Event::ProfileLoaded {
                     account: acc,
                     statuses: page.items,
@@ -647,46 +678,37 @@ async fn load_profile(
                 },
             )
             .await;
-            note_api_ok(events, state).await;
+            note_api_ok(ctx).await;
         }
         Err(e) => {
-            report_api_error(events, state, "profile posts", &e).await;
+            send(&ctx.events, Event::ProfileLoadFailed(id)).await;
+            report_api_error(ctx, "profile posts", &e).await;
         }
     }
 }
 
 /// Pull the viewer's current relationship to `id`. The API returns
 /// an array; we want the single entry matching the input.
-async fn load_relationship(
-    client: &MastodonClient,
-    state: &mut AppState,
-    events: &mpsc::Sender<Event>,
-    id: crate::api::models::AccountId,
-) {
-    match client.relationships(&[&id]).await {
+async fn load_relationship(ctx: &Ctx, id: AccountId) {
+    match ctx.client.relationships(&[&id]).await {
         Ok(mut rels) if !rels.is_empty() => {
-            send(events, Event::RelationshipLoaded(rels.remove(0))).await;
-            note_api_ok(events, state).await;
+            send(&ctx.events, Event::RelationshipLoaded(rels.remove(0))).await;
+            note_api_ok(ctx).await;
         }
         Ok(_) => {
             warn!(%id, "relationships returned empty array");
-            note_api_ok(events, state).await;
+            note_api_ok(ctx).await;
         }
-        Err(e) => {
-            report_api_error(events, state, "relationship", &e).await;
-        }
+        Err(e) => report_api_error(ctx, "relationship", &e).await,
     }
 }
 
 /// Fetch a page of followers / following for `id`. UI matches the
 /// reply by `(for_id, kind)` — both fields are echoed so two
-/// concurrent fetches (e.g., user opens followers then quickly
-/// switches to following) can't cross-pollute each other's state.
+/// concurrent fetches can't cross-pollute each other's state.
 async fn load_account_list(
-    client: &MastodonClient,
-    state: &mut AppState,
-    events: &mpsc::Sender<Event>,
-    id: crate::api::models::AccountId,
+    ctx: &Ctx,
+    id: AccountId,
     kind: AccountListKind,
     max_id: Option<String>,
 ) {
@@ -697,13 +719,13 @@ async fn load_account_list(
         ..Default::default()
     };
     let result = match kind {
-        AccountListKind::Followers => client.account_followers(&id, &params).await,
-        AccountListKind::Following => client.account_following(&id, &params).await,
+        AccountListKind::Followers => ctx.client.account_followers(&id, &params).await,
+        AccountListKind::Following => ctx.client.account_following(&id, &params).await,
     };
     match result {
         Ok(page) => {
             send(
-                events,
+                &ctx.events,
                 Event::AccountListLoaded {
                     for_id: id,
                     kind,
@@ -712,10 +734,15 @@ async fn load_account_list(
                 },
             )
             .await;
-            note_api_ok(events, state).await;
+            note_api_ok(ctx).await;
         }
         Err(e) => {
-            report_api_error(events, state, kind.label(), &e).await;
+            send(
+                &ctx.events,
+                Event::AccountListLoadFailed { for_id: id, kind },
+            )
+            .await;
+            report_api_error(ctx, kind.label(), &e).await;
         }
     }
 }
@@ -725,22 +752,16 @@ async fn load_account_list(
 /// UI already knows how to consume from `LoadRelationship`. On
 /// failure, send a typed revert event so the optimistic UI flip can
 /// reverse cleanly.
-async fn follow_action(
-    client: &MastodonClient,
-    state: &mut AppState,
-    events: &mpsc::Sender<Event>,
-    id: crate::api::models::AccountId,
-    attempted_follow: bool,
-) {
+async fn follow_action(ctx: &Ctx, id: AccountId, attempted_follow: bool) {
     let result = if attempted_follow {
-        client.follow(&id).await
+        ctx.client.follow(&id).await
     } else {
-        client.unfollow(&id).await
+        ctx.client.unfollow(&id).await
     };
     match result {
         Ok(rel) => {
-            send(events, Event::RelationshipLoaded(rel)).await;
-            note_api_ok(events, state).await;
+            send(&ctx.events, Event::RelationshipLoaded(rel)).await;
+            note_api_ok(ctx).await;
         }
         Err(e) => {
             let verb = if attempted_follow {
@@ -749,21 +770,20 @@ async fn follow_action(
                 "unfollow"
             };
             send(
-                events,
+                &ctx.events,
                 Event::RelationshipActionFailed {
                     id: id.clone(),
                     attempted_follow,
                 },
             )
             .await;
-            report_api_error(events, state, verb, &e).await;
+            report_api_error(ctx, verb, &e).await;
         }
     }
 }
 
 async fn status_action(
-    events: &mpsc::Sender<Event>,
-    state: &mut AppState,
+    ctx: &Ctx,
     id: StatusId,
     attempted: FailedAction,
     result: crate::api::ApiResult<Status>,
@@ -778,19 +798,19 @@ async fn status_action(
     };
     match result {
         Ok(status) => {
-            send(events, Event::StatusUpdated(status)).await;
-            note_api_ok(events, state).await;
+            send(&ctx.events, Event::StatusUpdated(status)).await;
+            note_api_ok(ctx).await;
         }
         Err(e) => {
             send(
-                events,
+                &ctx.events,
                 Event::StatusActionFailed {
                     id,
                     action: attempted,
                 },
             )
             .await;
-            report_api_error(events, state, verb, &e).await;
+            report_api_error(ctx, verb, &e).await;
         }
     }
 }
@@ -799,23 +819,43 @@ async fn send(tx: &mpsc::Sender<Event>, event: Event) {
     let _ = tx.send(event).await;
 }
 
+async fn toast(tx: &mpsc::Sender<Event>, level: ToastLevel, message: String) {
+    send(tx, Event::Toast { level, message }).await;
+}
+
 /// Record a successful API round-trip. If health was previously
 /// degraded / offline / auth-invalid, flips it back to Healthy and
 /// broadcasts. Cheap no-op when already Healthy.
-async fn note_api_ok(events: &mpsc::Sender<Event>, state: &mut AppState) {
-    if state.api_health != ApiHealth::Healthy {
-        state.api_health = ApiHealth::Healthy;
-        send(events, Event::ApiHealthChanged(ApiHealth::Healthy)).await;
+async fn note_api_ok(ctx: &Ctx) {
+    let changed = {
+        let mut st = lock(&ctx.state);
+        if st.api_health == ApiHealth::Healthy {
+            false
+        } else {
+            st.api_health = ApiHealth::Healthy;
+            true
+        }
+    };
+    if changed {
+        send(&ctx.events, Event::ApiHealthChanged(ApiHealth::Healthy)).await;
     }
 }
 
 /// Transition health based on an error category (only fires the event
 /// when the value actually changes).
-async fn note_api_error(events: &mpsc::Sender<Event>, state: &mut AppState, err: &ApiError) {
+async fn note_api_error(ctx: &Ctx, err: &ApiError) {
     let new_health = ApiHealth::from(err.category());
-    if new_health != ApiHealth::Healthy && state.api_health != new_health {
-        state.api_health = new_health;
-        send(events, Event::ApiHealthChanged(new_health)).await;
+    let changed = {
+        let mut st = lock(&ctx.state);
+        if new_health != ApiHealth::Healthy && st.api_health != new_health {
+            st.api_health = new_health;
+            true
+        } else {
+            false
+        }
+    };
+    if changed {
+        send(&ctx.events, Event::ApiHealthChanged(new_health)).await;
     }
 }
 
@@ -823,33 +863,23 @@ async fn note_api_error(events: &mpsc::Sender<Event>, state: &mut AppState, err:
 /// with a clean terse message, and bumps the health indicator. `verb`
 /// is a short phrase describing what was being attempted (e.g.
 /// `"favourite"` → `"favourite failed · network unreachable"`).
-async fn report_api_error(
-    events: &mpsc::Sender<Event>,
-    state: &mut AppState,
-    verb: &str,
-    err: &ApiError,
-) {
+async fn report_api_error(ctx: &Ctx, verb: &str, err: &ApiError) {
     warn!(?err, %verb, "api call failed");
     let level = match err.category() {
         ApiErrorCategory::NotFound | ApiErrorCategory::Client => ToastLevel::Warn,
         _ => ToastLevel::Error,
     };
-    send(
-        events,
-        Event::Toast {
-            level,
-            message: format!("{verb} failed · {}", err.terse()),
-        },
+    toast(
+        &ctx.events,
+        level,
+        format!("{verb} failed · {}", err.terse()),
     )
     .await;
-    note_api_error(events, state, err).await;
+    note_api_error(ctx, err).await;
 }
 
-#[allow(clippy::too_many_arguments)]
 async fn post_status(
-    client: &MastodonClient,
-    state: &mut AppState,
-    events: &mpsc::Sender<Event>,
+    ctx: &Ctx,
     text: String,
     in_reply_to_id: Option<StatusId>,
     quote_id: Option<StatusId>,
@@ -870,7 +900,7 @@ async fn post_status(
         Visibility::Direct => ApiVisibility::Direct,
     });
 
-    match client.post_status(&draft).await {
+    match ctx.client.post_status(&draft).await {
         Ok(status) => {
             let msg = if has_quote {
                 "quote posted"
@@ -879,61 +909,51 @@ async fn post_status(
             } else {
                 "posted"
             };
-            send(
-                events,
-                Event::Toast {
-                    level: ToastLevel::Info,
-                    message: msg.into(),
-                },
-            )
-            .await;
-            note_api_ok(events, state).await;
+            toast(&ctx.events, ToastLevel::Info, msg.into()).await;
+            note_api_ok(ctx).await;
             true
         }
         Err(e) => {
             let verb = if has_quote { "quote" } else { "post" };
-            report_api_error(events, state, verb, &e).await;
+            report_api_error(ctx, verb, &e).await;
             false
         }
     }
 }
 
-/// Initial (or post-switch) session kick-off: verify the token, learn
-/// the instance's `max_characters`. Emits the same events the startup
-/// path does so the UI can reuse `CredentialsLoaded` / `InstanceLoaded`
-/// handlers for both first boot and account-switch.
-async fn bootstrap_session(
-    client: &MastodonClient,
-    state: &mut AppState,
-    events: &mpsc::Sender<Event>,
-) {
-    match client.verify_credentials().await {
+/// Initial (or post-switch) session kick-off: verify the token and
+/// learn the instance's `max_characters`, concurrently. Emits the same
+/// events for first boot and account-switch so the UI reuses its
+/// `CredentialsLoaded` / `InstanceLoaded` handlers.
+async fn bootstrap_session(ctx: Ctx) {
+    let (me, inst) = tokio::join!(ctx.client.verify_credentials(), ctx.client.instance());
+    match me {
         Ok(me) => {
-            send(events, Event::CredentialsLoaded(me.clone())).await;
-            state.me = Some(me);
-            note_api_ok(events, state).await;
+            send(&ctx.events, Event::CredentialsLoaded(me.clone())).await;
+            lock(&ctx.state).me = Some(me);
+            note_api_ok(&ctx).await;
         }
         Err(e) => {
             warn!(?e, "verify_credentials failed");
-            report_api_error(events, state, "sign-in check", &e).await;
+            report_api_error(&ctx, "sign-in check", &e).await;
         }
     }
-    match client.instance().await {
+    match inst {
         Ok(inst) => {
             if let Some(max) = inst.max_characters() {
                 send(
-                    events,
+                    &ctx.events,
                     Event::InstanceLoaded {
                         max_characters: max,
                     },
                 )
                 .await;
             }
-            note_api_ok(events, state).await;
+            note_api_ok(&ctx).await;
         }
         Err(e) => {
             warn!(?e, "instance fetch failed");
-            note_api_error(events, state, &e).await;
+            note_api_error(&ctx, &e).await;
         }
     }
 }

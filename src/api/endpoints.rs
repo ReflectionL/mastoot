@@ -338,11 +338,11 @@ pub struct StatusDraft {
 
 /// Generates a random 32-char base32 string suitable for Idempotency-Key.
 fn random_idempotency_key() -> String {
-    use rand::Rng;
+    use rand::RngExt;
     const ALPHABET: &[u8] = b"0123456789abcdefghijklmnopqrstuv";
-    let mut rng = rand::thread_rng();
+    let mut rng = rand::rng();
     (0..32)
-        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
+        .map(|_| ALPHABET[rng.random_range(0..ALPHABET.len())] as char)
         .collect()
 }
 
@@ -493,7 +493,7 @@ impl MastodonClient {
             form = form.text("description", desc);
         }
 
-        let mut req = reqwest::Client::new().post(url).multipart(form);
+        let mut req = self.http().post(url).multipart(form);
         if let Some(token) = self.token() {
             use secrecy::ExposeSecret;
             req = req.bearer_auth(token.expose_secret());
