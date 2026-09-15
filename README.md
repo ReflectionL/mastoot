@@ -26,14 +26,36 @@ lists, voting.
 ## Quick start
 
 ```bash
-# Build (Rust 1.88+)
-cargo build --release
-
-# First run walks you through OAuth in the browser, then opens the TUI.
-cargo run --release -- --instance mastodon.social
+git clone git@github.com:ReflectionL/mastoot.git && cd mastoot
+cargo build --release          # rustup picks up rust-toolchain.toml; needs Rust 1.88+
+./target/release/mastoot --instance mastodon.social
 ```
 
+The first run walks you through OAuth in your browser, stores the token in
+the OS keyring, and opens the TUI. After that a bare `mastoot` is enough.
+The config file lives at `~/.config/mastoot/config.toml` on Linux and
+`~/Library/Application Support/io.github.reflectionl.mastoot/config.toml`
+on macOS; tokens are never written to it.
+
+macOS asks once whether mastoot may read the keychain — choose **Always
+Allow**, or it asks again on every launch.
+
 Other subcommands: `login`, `logout`, `whoami`, `accounts`, `switch <handle>`.
+
+### Headless / over SSH
+
+Two things differ on a server without a desktop:
+
+- **Keyring.** On Linux the token is stored through Secret Service
+  (gnome-keyring, KDE Wallet). A bare server usually has none, and login
+  will fail when it tries to save the token. Start one first, e.g.
+  `dbus-run-session -- sh -c 'gnome-keyring-daemon --components=secrets --unlock; mastoot'`.
+  There is no file-based fallback yet.
+- **OAuth callback.** `mastoot login --no-browser` prints the authorization
+  URL for you to open locally, but the browser then redirects to
+  `127.0.0.1:<port>/callback` — a port on the *server*. Forward it before
+  logging in, using the port shown in the `login` output:
+  `ssh -L <port>:127.0.0.1:<port> your-server`.
 
 ## Keys
 
