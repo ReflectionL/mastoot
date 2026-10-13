@@ -498,7 +498,7 @@ async fn streaming_loop(ctx: Ctx) {
     let mut backoff = STREAM_BACKOFF_MIN;
     loop {
         send(&ctx.events, Event::StreamState(StreamState::Connecting)).await;
-        match UserStream::open(&ctx.client).await {
+        match UserStream::open(&ctx.client) {
             Ok(mut s) => {
                 send(&ctx.events, Event::StreamState(StreamState::Connected)).await;
                 backoff = STREAM_BACKOFF_MIN;

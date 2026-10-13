@@ -252,6 +252,6 @@ mod tests {
         let input = vec![plain("a"), Line::default(), plain("b")];
         let out = wrap_lines(&input, 10);
         assert_eq!(out.len(), 3);
-        assert!(out[1].spans.is_empty());
+        assert_eq!(out[1].spans.len(), 0);
     }
 }

@@ -2,4 +2,5 @@
 
 pub mod clipboard;
 pub mod emoji;
+pub mod lru;
 pub mod time;

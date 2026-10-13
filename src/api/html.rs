@@ -497,7 +497,7 @@ mod tests {
         let theme = Theme::frost();
         let html = "<p>hi <span class=\"mention\">@user</span></p>";
         let lines = render(html, &theme);
-        assert!(!lines.is_empty());
+        assert_ne!(lines.len(), 0);
         assert!(lines.iter().any(|l| !l.spans.is_empty()));
     }
 

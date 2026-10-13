@@ -93,7 +93,8 @@ mastoot/
 │   │   └── event.rs            # Action / Event enum
 │   └── ui/
 │       ├── mod.rs
-│       ├── app.rs              # 主循环 + screen router
+│       ├── app.rs              # 入口 / App 结构体 / 模式栈 / 主循环
+│       ├── app/                # input.rs 按键 · events.rs 事件折叠 · render.rs 整帧渲染
 │       ├── theme.rs            # 配色和字体层次
 │       ├── screens/
 │       │   ├── timeline.rs
@@ -107,12 +108,12 @@ mastoot/
 │       └── widgets/
 │           ├── status_card.rs  # 核心组件 + RenderPrefs
 │           ├── shortcode.rs    # 自定义 emoji 短码降色
-│           ├── reply_preview.rs
-│           ├── alt_text.rs
-│           ├── media.rs        # 图片/视频占位与实际渲染
-│           └── help.rs
+│           ├── notification_card.rs
+│           ├── textarea.rs     # compose 用的自写输入框
+│           └── wrap.rs         # CJK-aware 换行
 │   └── util/
 │       ├── emoji.rs            # emoji 宽度归一
+│       ├── lru.rs              # 带容量的 LRU map（图片缓存用）
 │       ├── time.rs             # 相对 / 绝对时间
 │       └── clipboard.rs        # OSC 52 + pbcopy
 ├── scripts/
@@ -449,6 +450,7 @@ cargo run --example fetch_home
 
 ### Phase 5  多账号 + quote 完整链路  ·  2026-04-18
 
+- 整理 · 2026-10-13 — 补建 `UPDATE_LOG.md`；删四个空壳 widget 模块；`ui/app.rs` 拆成 `app/{input,events,render}.rs`；`ImageCache` 改用 `util::lru::LruMap`（上限 96 张）
 - 第三轮 · 2026-09-15 — 线程页回复树缩进（按 `in_reply_to_id` 算深度，2 列/级封顶 4 级）；真正的 reply preview `↪ @acct: "…"`（同列表 + `parents` 缓存 + `Action::LoadStatus` 按需拉）；图片占位按宽高比；`TestBackend` 快照测试 `ui/snapshots.rs`；解码进 `spawn_blocking` + 下载 4 并发；`6`/`7` 收藏 / 书签 tab；`e` 编辑帖子（`/source` + PUT）；`scripts/tui_snapshot.py` + `codesign-dev.sh`
 - 优化第二轮 · 2026-09-14 — `/` 搜索（prompt 行内输入 + accounts / hashtags / posts 结果页 + 标签时间线复用同一 screen）；自定义 emoji 短码 `:x:` 降 tertiary（`widgets/shortcode.rs`）；全局密度 atomic 换成 `status_card::RenderPrefs` 传参；通知摘要跳空行；依赖升级 toml 1 / directories 6 / rand 0.10 / scraper 0.27
 - 全面优化 · 2026-09-13 — 性能：`html::render_with_links` 按 (html, theme) 线程本地缓存；state task 改为每 action 一个 task（`JoinSet`，切账号 `abort_all`），`AppState` 只留 cursor / health（`Arc<Mutex>`），删掉与 UI 重复的 `TimelineStore`；全局共享 `reqwest::Client`（`client::shared_http` / `shared_stream_http`）；冷启动 verify + instance + home 三路并发。正确性：Esc 退出改成 `QuitConfirm` 弹窗；toast 改 `Instant` 计时 + 1s ticker；SSE 加 90s read timeout + 关掉 eventsource 内层重试；LoadMore 空页标 `exhausted`、失败 `LoadMoreFailed` 解锁；`StatusDeleted` 传播到 detail / profile / notifications / back_stack；polling 也拉 notifications；`<p>` 段落之间补回 1 空行（之前实际是 0）。功能：`o` 浏览器打开、`y` 复制链接（OSC 52 + pbcopy）、reply 提示行 `↪ replying to @…`、投票条、链接卡片一行、HTML 补 ul/ol/li/blockquote/pre/code/h1-6/strong/em/del/u；config 接线 `media_render` / `show_relative_time` / 新 `image_protocol`。结构：`app.rs` 跨 Mode 状态键（c/r/q/d/u/Q/o/y）统一到 `handle_status_keys`；`emoji::normalize` 返回 `Cow`；删重复 `wrap_text`；去掉 `futures-util`。测试：client 本地 mock server 4 条（429 退避 / Link 分页 / bearer+query / 错误映射）；CI 加 MSRV 1.88 job；README 重写；补 `LICENSE-APACHE`

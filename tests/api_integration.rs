@@ -24,7 +24,7 @@ async fn verify_credentials_against_real_server() {
     let token = config::load_token(&handle).expect("no token in keyring");
     let client = MastodonClient::new(&instance, token).unwrap();
     let me = client.verify_credentials().await.unwrap();
-    assert!(!me.username.is_empty());
+    assert_ne!(me.username, "");
 }
 
 #[tokio::test]
