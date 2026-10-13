@@ -322,8 +322,7 @@ impl App {
                     return;
                 }
                 self.notifications.insert(0, n);
-                let len = self.notifications.len();
-                self.notifications_screen.on_prepended(1, len);
+                self.notifications_screen.on_prepended(&self.notifications);
             }
             Event::SearchResults { query, results } => {
                 if let Mode::Search(s) = &mut self.mode
