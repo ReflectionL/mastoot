@@ -43,6 +43,10 @@ on:
   push:
     tags:
       - '**[0-9]+.[0-9]+.[0-9]+*'
+  # Hand edit (see allow-dirty in dist-workspace.toml): auto-tag.yml starts
+  # this workflow on the tag it creates, because a tag pushed with
+  # GITHUB_TOKEN does not trigger the push event above.
+  workflow_dispatch:
 
 jobs:
   # Run 'dist plan' (or host) to determine what tasks we need to do

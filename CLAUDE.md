@@ -453,6 +453,7 @@ cargo run --example fetch_home
 
 ### Phase 5  多账号 + quote 完整链路  ·  2026-04-18
 
+- 自动发版 · 2026-10-13 — main 上 `Cargo.toml` 版本号变化 → `auto-tag.yml` 建 `vX.Y.Z` tag 并 dispatch `release.yml`（手加 `workflow_dispatch`，`allow-dirty = ["ci"]`）
 - 自更新 · 2026-10-13 — `mastoot update [--check]`（`commands/update.rs`，内嵌 axoupdater，读 cargo-dist 安装回执）；无回执时提示 brew / 源码升级办法；README 加 Install 一节
 - 发帖带附件 · 2026-10-13 — compose `Ctrl+A` 附件（路径 → alt text）/ `Ctrl+X` 删除；`Action::UploadMedia` / `Event::MediaUploaded`；`upload_media_ready` 轮询服务端处理；最多 4 个，编辑模式禁用
 - 通知合并 · 2026-10-13 — 同一帖的点赞 / 转发折成一行（`Alice, Bob and 3 others favourited your post`）；`NotificationsScreen::groups()` + `notification_card::render_group`；游标按组走，新通知按 anchor id 找回所属组

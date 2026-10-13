@@ -1,0 +1,41 @@
+# Tags a release when `version` in Cargo.toml changes on main.
+#
+# Bump the version in a PR, merge it, and this workflow creates `vX.Y.Z`
+# and starts the cargo-dist Release workflow on it. (A tag pushed with the
+# built-in GITHUB_TOKEN does not trigger other workflows by itself, so we
+# start release.yml explicitly via workflow_dispatch.)
+
+name: Auto tag
+
+on:
+  push:
+    branches: [main]
+    paths: [Cargo.toml]
+
+permissions:
+  contents: write
+  actions: write
+
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create tag and start the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -n1)
+          if [ -z "$version" ]; then
+            echo "could not read version from Cargo.toml" >&2
+            exit 1
+          fi
+          tag="v$version"
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "$tag already exists; nothing to do"
+            exit 0
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" \
+            -f ref="refs/tags/$tag" -f sha="$GITHUB_SHA"
+          gh workflow run release.yml --ref "$tag"
+          echo "created $tag and started the Release workflow"

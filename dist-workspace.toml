@@ -19,3 +19,5 @@ publish-jobs = ["homebrew"]
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
+# release.yml carries a hand-added workflow_dispatch trigger (auto-tag.yml)
+allow-dirty = ["ci"]
