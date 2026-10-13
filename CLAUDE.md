@@ -350,6 +350,8 @@ Theme {
 | `Esc` | 取消（有确认弹窗） |
 | `Ctrl+W` | 设置可见性 |
 | `Ctrl+S` | 切换敏感内容标记 |
+| `Ctrl+A` | 附加文件（路径 → alt text） |
+| `Ctrl+X` | 移除最后一个附件 |
 
 ## 8. 代码规范
 
@@ -451,6 +453,7 @@ cargo run --example fetch_home
 
 ### Phase 5  多账号 + quote 完整链路  ·  2026-04-18
 
+- 发帖带附件 · 2026-10-13 — compose `Ctrl+A` 附件（路径 → alt text）/ `Ctrl+X` 删除；`Action::UploadMedia` / `Event::MediaUploaded`；`upload_media_ready` 轮询服务端处理；最多 4 个，编辑模式禁用
 - 通知合并 · 2026-10-13 — 同一帖的点赞 / 转发折成一行（`Alice, Bob and 3 others favourited your post`）；`NotificationsScreen::groups()` + `notification_card::render_group`；游标按组走，新通知按 anchor id 找回所属组
 - 键位表 · 2026-10-13 — 新 `ui/keymap.rs` 作为帮助浮层和 README 键位表的唯一来源，`readme_key_table_matches_keymap` 测试防漂移
 - 整理 · 2026-10-13 — 补建 `UPDATE_LOG.md`；删四个空壳 widget 模块；`ui/app.rs` 拆成 `app/{input,events,render}.rs`；`ImageCache` 改用 `util::lru::LruMap`（上限 96 张）

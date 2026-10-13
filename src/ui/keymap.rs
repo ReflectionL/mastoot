@@ -87,6 +87,8 @@ pub const SECTIONS: &[Section] = &[
             b("Esc", "cancel (asks first if there is a draft)"),
             b("Ctrl+W", "cycle visibility"),
             b("Ctrl+S", "toggle content warning"),
+            b("Ctrl+A", "attach a file (path, then optional alt text)"),
+            b("Ctrl+X", "remove the last attachment"),
             b("Tab", "switch between body and content warning"),
         ],
     },

@@ -479,7 +479,89 @@ impl MastodonClient {
 // Media
 // ---------------------------------------------------------------------------
 
+/// Total time budget for one media upload request.
+const UPLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
+
+/// How long [`MastodonClient::upload_media_ready`] waits for the
+/// server to finish processing (transcoding) an upload.
+const PROCESSING_POLLS: u32 = 30;
+const PROCESSING_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// MIME type for an attachment, judged by file extension. `None` for
+/// anything Mastodon wouldn't take as media.
+#[must_use]
+pub fn mime_for_path(path: &std::path::Path) -> Option<&'static str> {
+    let ext = path.extension()?.to_str()?.to_ascii_lowercase();
+    Some(match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "avif" => "image/avif",
+        "heic" => "image/heic",
+        "mp4" | "m4v" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "mp3" => "audio/mpeg",
+        "ogg" | "oga" => "audio/ogg",
+        "wav" => "audio/wav",
+        "flac" => "audio/flac",
+        "m4a" => "audio/mp4",
+        _ => return None,
+    })
+}
+
 impl MastodonClient {
+    /// GET /api/v1/media/{id} — the attachment, or (HTTP 206, `url`
+    /// still null) one the server is still processing.
+    pub async fn media(&self, id: &MediaId) -> ApiResult<MediaAttachment> {
+        self.get(&format!("/api/v1/media/{id}"), &[]).await
+    }
+
+    /// [`Self::upload_media`], then wait until the server has finished
+    /// processing the file. `POST /api/v2/media` answers 202 for videos
+    /// and large images; attaching one that isn't ready yet is rejected
+    /// with 422, so callers need the settled attachment.
+    pub async fn upload_media_ready(
+        &self,
+        bytes: Vec<u8>,
+        filename: impl Into<String>,
+        mime: impl Into<String>,
+        description: Option<String>,
+    ) -> ApiResult<MediaAttachment> {
+        self.upload_media_ready_every(bytes, filename, mime, description, PROCESSING_POLL_INTERVAL)
+            .await
+    }
+
+    /// [`Self::upload_media_ready`] with an explicit polling interval
+    /// (tests use a tiny one).
+    pub(crate) async fn upload_media_ready_every(
+        &self,
+        bytes: Vec<u8>,
+        filename: impl Into<String>,
+        mime: impl Into<String>,
+        description: Option<String>,
+        interval: std::time::Duration,
+    ) -> ApiResult<MediaAttachment> {
+        let mut media = self
+            .upload_media(bytes, filename, mime, description)
+            .await?;
+        for _ in 0..PROCESSING_POLLS {
+            if media.url.is_some() {
+                return Ok(media);
+            }
+            tokio::time::sleep(interval).await;
+            media = self.media(&media.id).await?;
+        }
+        if media.url.is_some() {
+            Ok(media)
+        } else {
+            Err(crate::api::error::ApiError::Other(
+                "server is still processing the file".into(),
+            ))
+        }
+    }
+
     /// POST /api/v2/media — upload a file as a multipart body.
     /// Attaches `description` (alt text) when provided.
     pub async fn upload_media(
@@ -503,7 +585,13 @@ impl MastodonClient {
             form = form.text("description", desc);
         }
 
-        let mut req = self.http().post(url).multipart(form);
+        // Uploads can legitimately outlast the 60 s default (big video
+        // on a slow link), so give them their own budget.
+        let mut req = self
+            .http()
+            .post(url)
+            .timeout(UPLOAD_TIMEOUT)
+            .multipart(form);
         if let Some(token) = self.token() {
             use secrecy::ExposeSecret;
             req = req.bearer_auth(token.expose_secret());
@@ -563,5 +651,23 @@ impl MastodonClient {
     /// GET /api/v2/instance — modern replacement for v1. Works without auth.
     pub async fn instance(&self) -> ApiResult<Instance> {
         self.get("/api/v2/instance", &[]).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn mime_follows_the_extension_case_insensitively() {
+        assert_eq!(mime_for_path(Path::new("/tmp/a.PNG")), Some("image/png"));
+        assert_eq!(mime_for_path(Path::new("b.jpeg")), Some("image/jpeg"));
+        assert_eq!(
+            mime_for_path(Path::new("clip.mov")),
+            Some("video/quicktime")
+        );
+        assert_eq!(mime_for_path(Path::new("notes.txt")), None);
+        assert_eq!(mime_for_path(Path::new("no_extension")), None);
     }
 }

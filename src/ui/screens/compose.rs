@@ -27,8 +27,13 @@
 //! - `Esc` → cancel (the app layer decides whether to show a confirm)
 //! - `Ctrl+W` → cycle visibility
 //! - `Ctrl+S` → toggle CW field (and focus it on toggle-on)
+//! - `Ctrl+A` → attach a file: a one-line path prompt, then an
+//!   optional alt-text prompt (`Enter` skips); `Ctrl+X` drops the last
+//!   attachment
 //! - `Tab` / `Shift+Tab` → switch focus body ↔ spoiler
 //! - everything else routed to the focused text area
+
+use std::path::{Path, PathBuf};
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -37,8 +42,9 @@ use ratatui::style::Modifier;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::api::endpoints::mime_for_path;
 use crate::api::html;
-use crate::api::models::{StatusId, StatusSource};
+use crate::api::models::{MediaId, StatusId, StatusSource};
 use crate::icons;
 use crate::state::Visibility;
 use crate::ui::Theme;
@@ -65,6 +71,41 @@ pub struct QuoteContext {
     pub excerpt: String,
 }
 
+/// Most attachments one post can carry (Mastodon's default cap).
+pub const MAX_ATTACHMENTS: usize = 4;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttachState {
+    /// Sent to the state task; waiting for the server to take it.
+    Uploading,
+    /// Uploaded and processed — safe to reference in the post.
+    Ready(MediaId),
+}
+
+#[derive(Debug, Clone)]
+struct Attachment {
+    /// Handle shared with the state task so the answer finds its row.
+    local_id: u64,
+    name: String,
+    alt: Option<String>,
+    state: AttachState,
+}
+
+/// The one-line prompt `Ctrl+A` opens at the bottom of the screen.
+#[derive(Debug, Clone)]
+enum Prompt {
+    Path(String),
+    Alt { path: PathBuf, text: String },
+}
+
+/// What the app layer must upload (see `Action::UploadMedia`).
+#[derive(Debug, Clone)]
+pub struct UploadRequest {
+    pub local_id: u64,
+    pub path: PathBuf,
+    pub alt: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Body,
@@ -86,6 +127,12 @@ pub struct ComposeState {
     edit_of: Option<StatusId>,
     focus: Focus,
     max_chars: usize,
+    attachments: Vec<Attachment>,
+    next_local_id: u64,
+    prompt: Option<Prompt>,
+    /// One-shot message for the footer ("4 attachments max"); cleared
+    /// by the next key.
+    notice: Option<&'static str>,
 }
 
 /// Return value of [`ComposeState::handle_key`].
@@ -97,6 +144,9 @@ pub enum ComposeOutcome {
     Cancel,
     /// User hit submit. Contains the full draft payload.
     Submit(ComposeDraft),
+    /// User confirmed an attachment; the app layer should start the
+    /// upload.
+    Upload(UploadRequest),
 }
 
 /// Plain-data form of what we'll send to the API. Translated to
@@ -109,6 +159,8 @@ pub struct ComposeDraft {
     pub sensitive: bool,
     pub visibility: Visibility,
     pub edit_of: Option<StatusId>,
+    /// Uploaded attachments, in the order they were added.
+    pub media_ids: Vec<MediaId>,
 }
 
 impl ComposeState {
@@ -179,6 +231,10 @@ impl ComposeState {
             edit_of: None,
             focus: Focus::Body,
             max_chars,
+            attachments: Vec::new(),
+            next_local_id: 0,
+            prompt: None,
+            notice: None,
         }
     }
 
@@ -201,7 +257,14 @@ impl ComposeState {
 
     fn submit(&self) -> Option<ComposeDraft> {
         let text = self.body.text();
-        if text.trim().is_empty() || self.over_limit() {
+        // Media alone is a valid post; text alone is too. Wait for
+        // in-flight uploads — the server rejects half-processed ids.
+        let has_media = !self.attachments.is_empty();
+        let uploading = self
+            .attachments
+            .iter()
+            .any(|a| a.state == AttachState::Uploading);
+        if (text.trim().is_empty() && !has_media) || self.over_limit() || uploading {
             return None;
         }
         let spoiler = if self.cw_enabled {
@@ -223,7 +286,104 @@ impl ComposeState {
             content_warning: spoiler,
             visibility: self.visibility,
             edit_of: self.edit_of.clone(),
+            media_ids: self
+                .attachments
+                .iter()
+                .filter_map(|a| match &a.state {
+                    AttachState::Ready(id) => Some(id.clone()),
+                    AttachState::Uploading => None,
+                })
+                .collect(),
         })
+    }
+
+    /// The state task answered an upload. Returns `false` when the
+    /// attachment is gone (the user removed it meanwhile), so the
+    /// caller can stay quiet about a failure nobody is waiting on.
+    pub fn on_upload_result(&mut self, local_id: u64, result: Result<MediaId, String>) -> bool {
+        let Some(pos) = self.attachments.iter().position(|a| a.local_id == local_id) else {
+            return false;
+        };
+        match result {
+            Ok(id) => self.attachments[pos].state = AttachState::Ready(id),
+            Err(_) => {
+                self.attachments.remove(pos);
+            }
+        }
+        true
+    }
+
+    /// Keys while the attach prompt is open: it swallows everything.
+    fn handle_prompt_key(&mut self, key: KeyEvent) -> ComposeOutcome {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(prompt) = self.prompt.take() else {
+            return ComposeOutcome::Continue;
+        };
+        match (key.code, prompt) {
+            (KeyCode::Esc, _) => {}
+            (KeyCode::Enter, Prompt::Path(raw)) => {
+                if raw.trim().is_empty() {
+                    return ComposeOutcome::Continue;
+                }
+                let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
+                let path = expand_path(&raw, home.as_deref());
+                if !path.is_file() {
+                    self.notice = Some("no such file");
+                    self.prompt = Some(Prompt::Path(raw));
+                } else if mime_for_path(&path).is_none() {
+                    self.notice = Some("unsupported file type");
+                    self.prompt = Some(Prompt::Path(raw));
+                } else {
+                    self.prompt = Some(Prompt::Alt {
+                        path,
+                        text: String::new(),
+                    });
+                }
+            }
+            (KeyCode::Enter, Prompt::Alt { path, text }) => {
+                let alt = Some(text.trim().to_string()).filter(|t| !t.is_empty());
+                let local_id = self.next_local_id;
+                self.next_local_id += 1;
+                self.attachments.push(Attachment {
+                    local_id,
+                    name: path
+                        .file_name()
+                        .map_or_else(String::new, |n| n.to_string_lossy().into_owned()),
+                    alt: alt.clone(),
+                    state: AttachState::Uploading,
+                });
+                return ComposeOutcome::Upload(UploadRequest {
+                    local_id,
+                    path,
+                    alt,
+                });
+            }
+            (code, mut prompt) => {
+                let text = match &mut prompt {
+                    Prompt::Path(t) | Prompt::Alt { text: t, .. } => t,
+                };
+                match code {
+                    KeyCode::Backspace => {
+                        text.pop();
+                    }
+                    KeyCode::Char('u') if ctrl => text.clear(),
+                    KeyCode::Char(c) if !ctrl => text.push(c),
+                    _ => {}
+                }
+                self.prompt = Some(prompt);
+            }
+        }
+        ComposeOutcome::Continue
+    }
+
+    fn open_attach_prompt(&mut self) {
+        if self.edit_of.is_some() {
+            self.notice = Some("can't change attachments while editing");
+        } else if self.attachments.len() >= MAX_ATTACHMENTS {
+            self.notice = Some("4 attachments max");
+        } else {
+            self.prompt = Some(Prompt::Path(String::new()));
+        }
     }
 
     fn cycle_visibility(&mut self) {
@@ -263,6 +423,11 @@ impl ComposeState {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
 
+        self.notice = None;
+        if self.prompt.is_some() {
+            return self.handle_prompt_key(key);
+        }
+
         // Submit: Ctrl+Enter / Alt+Enter / Ctrl+D.
         if matches!(key.code, KeyCode::Enter) && (ctrl || alt) {
             return match self.submit() {
@@ -287,6 +452,14 @@ impl ComposeState {
         }
         if ctrl && matches!(key.code, KeyCode::Char('s')) {
             self.toggle_cw();
+            return ComposeOutcome::Continue;
+        }
+        if ctrl && matches!(key.code, KeyCode::Char('a')) {
+            self.open_attach_prompt();
+            return ComposeOutcome::Continue;
+        }
+        if ctrl && matches!(key.code, KeyCode::Char('x')) {
+            self.attachments.pop();
             return ComposeOutcome::Continue;
         }
         if matches!(key.code, KeyCode::Tab | KeyCode::BackTab) {
@@ -318,6 +491,7 @@ impl ComposeState {
             0
         };
         let cw_height: u16 = if self.cw_enabled { 2 } else { 0 };
+        let attach_height = (self.attachments.len() + usize::from(self.prompt.is_some())) as u16;
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -327,6 +501,7 @@ impl ComposeState {
                 Constraint::Length(preview_height), // reply / quote preview
                 Constraint::Length(cw_height),      // CW
                 Constraint::Min(3),                 // body
+                Constraint::Length(attach_height),  // attachments + prompt
                 Constraint::Length(2),              // footer
             ])
             .split(area);
@@ -339,7 +514,10 @@ impl ComposeState {
             self.render_cw(frame, chunks[2], theme);
         }
         self.render_body(frame, chunks[3], theme);
-        self.render_footer(frame, chunks[4], theme, nerd_font);
+        if attach_height > 0 {
+            self.render_attachments(frame, chunks[4], theme, nerd_font);
+        }
+        self.render_footer(frame, chunks[5], theme, nerd_font);
     }
 
     fn render_title(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
@@ -423,13 +601,67 @@ impl ComposeState {
     }
 
     fn render_body(&mut self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
-        let focused = self.focus == Focus::Body;
+        let focused = self.focus == Focus::Body && self.prompt.is_none();
         let style = if focused {
             theme.primary()
         } else {
             theme.secondary()
         };
         self.body.render(frame, area, style, focused);
+    }
+
+    /// One row per attachment, then the open prompt (which owns the
+    /// cursor while it exists).
+    fn render_attachments(
+        &self,
+        frame: &mut Frame<'_>,
+        area: Rect,
+        theme: &Theme,
+        nerd_font: bool,
+    ) {
+        let icon = icons::pick(nerd_font, icons::IMAGE, icons::IMAGE_ASCII);
+        let mut lines: Vec<Line<'static>> = self
+            .attachments
+            .iter()
+            .map(|a| {
+                let (state, state_style) = match a.state {
+                    AttachState::Uploading => ("uploading…", theme.favorite_style()),
+                    AttachState::Ready(_) => ("ready", theme.boost_style()),
+                };
+                let alt = a.alt.as_deref().map_or_else(
+                    || Span::styled("no alt text", theme.tertiary()),
+                    |t| {
+                        Span::styled(
+                            format!("alt: {}", truncate_chars(t, 40, "…")),
+                            theme.secondary(),
+                        )
+                    },
+                );
+                Line::from(vec![
+                    Span::styled(format!("{icon} "), theme.secondary()),
+                    Span::styled(a.name.clone(), theme.primary()),
+                    Span::styled("  ·  ", theme.tertiary()),
+                    Span::styled(state, state_style),
+                    Span::styled("  ·  ", theme.tertiary()),
+                    alt,
+                ])
+            })
+            .collect();
+        if let Some(prompt) = &self.prompt {
+            let (label, text) = match prompt {
+                Prompt::Path(t) => ("attach file › ", t),
+                Prompt::Alt { text, .. } => ("alt text (Enter to skip) › ", text),
+            };
+            let width = label.chars().count() + text.chars().count();
+            lines.push(Line::from(vec![
+                Span::styled(label, theme.display_name()),
+                Span::styled(text.clone(), theme.primary()),
+            ]));
+            let row = (lines.len() - 1) as u16;
+            let x = area.x + (width as u16).min(area.width.saturating_sub(1));
+            frame.set_cursor_position((x, area.y + row.min(area.height.saturating_sub(1))));
+        }
+        frame.render_widget(Paragraph::new(lines), area);
     }
 
     fn render_footer(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme, nerd_font: bool) {
@@ -456,10 +688,13 @@ impl ComposeState {
                 theme.secondary().add_modifier(Modifier::BOLD),
             ),
         ]);
-        let line2 = Line::from(Span::styled(
-            "Ctrl+Enter send · Esc cancel · Ctrl+W visibility · Ctrl+S CW · Tab focus",
-            theme.tertiary(),
-        ));
+        let line2 = match self.notice {
+            Some(msg) => Line::from(Span::styled(msg, theme.error_style())),
+            None => Line::from(Span::styled(
+                "Ctrl+Enter send · Esc cancel · Ctrl+W vis · Ctrl+S CW · Ctrl+A attach · Tab focus",
+                theme.tertiary(),
+            )),
+        };
         frame.render_widget(Paragraph::new(vec![line1, line2]), area);
     }
 }
@@ -494,6 +729,24 @@ pub fn quote_context_from(
         id: status.id.clone(),
         author_acct: status.account.acct.clone(),
         excerpt,
+    }
+}
+
+/// Turn what the user typed or pasted into a path: surrounding quotes
+/// and backslash-escaped spaces (what a terminal inserts when a file is
+/// dragged onto it) are undone, and a leading `~` becomes `home`.
+fn expand_path(raw: &str, home: Option<&Path>) -> PathBuf {
+    let t = raw.trim();
+    let t = t
+        .strip_prefix('"')
+        .and_then(|r| r.strip_suffix('"'))
+        .or_else(|| t.strip_prefix('\'').and_then(|r| r.strip_suffix('\'')))
+        .unwrap_or(t)
+        .replace("\\ ", " ");
+    match (t.strip_prefix("~/"), home) {
+        (Some(rest), Some(h)) => h.join(rest),
+        _ if t == "~" => home.map_or_else(|| PathBuf::from(&t), Path::to_path_buf),
+        _ => PathBuf::from(t),
     }
 }
 
@@ -624,5 +877,169 @@ mod tests {
             state: crossterm::event::KeyEventState::NONE,
         });
         assert!(matches!(out, ComposeOutcome::Continue));
+    }
+
+    fn press(c: &mut ComposeState, code: KeyCode, mods: KeyModifiers) -> ComposeOutcome {
+        c.handle_key(KeyEvent {
+            code,
+            modifiers: mods,
+            kind: crossterm::event::KeyEventKind::Press,
+            state: crossterm::event::KeyEventState::NONE,
+        })
+    }
+
+    fn type_text(c: &mut ComposeState, text: &str) {
+        for ch in text.chars() {
+            press(c, KeyCode::Char(ch), KeyModifiers::NONE);
+        }
+    }
+
+    /// A real (empty) `.png` the attach prompt will accept.
+    fn temp_png(name: &str) -> PathBuf {
+        let p = std::env::temp_dir().join(format!("mastoot-test-{}-{name}", std::process::id()));
+        std::fs::write(&p, b"x").unwrap();
+        p
+    }
+
+    /// Drive the whole attach flow; returns the resulting request.
+    fn attach(c: &mut ComposeState, path: &Path, alt: &str) -> UploadRequest {
+        press(c, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        type_text(c, &path.to_string_lossy());
+        press(c, KeyCode::Enter, KeyModifiers::NONE);
+        type_text(c, alt);
+        match press(c, KeyCode::Enter, KeyModifiers::NONE) {
+            ComposeOutcome::Upload(req) => req,
+            _ => panic!("expected Upload"),
+        }
+    }
+
+    #[test]
+    fn attach_flow_uploads_then_submits_media_only() {
+        let png = temp_png("flow.png");
+        let mut c = ComposeState::blank(DEFAULT_MAX_CHARS);
+        let req = attach(&mut c, &png, "a cat");
+        assert_eq!(req.path, png);
+        assert_eq!(req.alt.as_deref(), Some("a cat"));
+
+        // Still uploading: Ctrl+Enter must not send half-processed media.
+        let submit = |c: &mut ComposeState| press(c, KeyCode::Enter, KeyModifiers::CONTROL);
+        assert!(matches!(submit(&mut c), ComposeOutcome::Continue));
+
+        assert!(c.on_upload_result(req.local_id, Ok(MediaId::new("m1"))));
+        match submit(&mut c) {
+            ComposeOutcome::Submit(d) => {
+                assert_eq!(d.media_ids, vec![MediaId::new("m1")]);
+                assert_eq!(d.text.trim(), "");
+            }
+            _ => panic!("media alone should be a valid post"),
+        }
+        let _ = std::fs::remove_file(png);
+    }
+
+    #[test]
+    fn failed_upload_drops_the_attachment() {
+        let png = temp_png("fail.png");
+        let mut c = ComposeState::blank(DEFAULT_MAX_CHARS);
+        let req = attach(&mut c, &png, "");
+        assert_eq!(req.alt, None, "an empty alt prompt means no alt text");
+        assert!(c.on_upload_result(req.local_id, Err("boom".into())));
+        assert!(c.attachments.is_empty());
+        // The row is gone, so a late answer is not news.
+        assert!(!c.on_upload_result(req.local_id, Ok(MediaId::new("m"))));
+        let _ = std::fs::remove_file(png);
+    }
+
+    #[test]
+    fn bad_paths_keep_the_prompt_open() {
+        let mut c = ComposeState::blank(DEFAULT_MAX_CHARS);
+        press(&mut c, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        type_text(&mut c, "/definitely/not/here.png");
+        press(&mut c, KeyCode::Enter, KeyModifiers::NONE);
+        assert!(matches!(c.prompt, Some(Prompt::Path(_))));
+        assert_eq!(c.notice, Some("no such file"));
+
+        // Esc closes the prompt without cancelling the compose.
+        let out = press(&mut c, KeyCode::Esc, KeyModifiers::NONE);
+        assert!(matches!(out, ComposeOutcome::Continue));
+        assert!(c.prompt.is_none());
+    }
+
+    #[test]
+    fn ctrl_x_removes_the_last_attachment_and_edit_mode_refuses() {
+        let png = temp_png("rm.png");
+        let mut c = ComposeState::blank(DEFAULT_MAX_CHARS);
+        attach(&mut c, &png, "");
+        press(&mut c, KeyCode::Char('x'), KeyModifiers::CONTROL);
+        assert!(c.attachments.is_empty());
+
+        let mut e = ComposeState::blank(DEFAULT_MAX_CHARS);
+        e.edit_of = Some(StatusId::new("9"));
+        press(&mut e, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        assert!(e.prompt.is_none());
+        assert!(e.notice.is_some());
+        let _ = std::fs::remove_file(png);
+    }
+
+    #[test]
+    fn expand_path_undoes_shell_escaping_and_tilde() {
+        let home = Path::new("/home/me");
+        assert_eq!(
+            expand_path("~/Pictures/a b.png", Some(home)),
+            PathBuf::from("/home/me/Pictures/a b.png")
+        );
+        assert_eq!(
+            expand_path("/tmp/a\\ b.png", Some(home)),
+            PathBuf::from("/tmp/a b.png")
+        );
+        assert_eq!(
+            expand_path("'/tmp/x y.png'", Some(home)),
+            PathBuf::from("/tmp/x y.png")
+        );
+        assert_eq!(
+            expand_path("\"/tmp/q.png\"", None),
+            PathBuf::from("/tmp/q.png")
+        );
+    }
+
+    fn screen(c: &mut ComposeState) -> String {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+        let (w, h) = (72u16, 14u16);
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| {
+            let area = f.area();
+            c.render(f, area, &Theme::frost(), false);
+        })
+        .unwrap();
+        let buf = term.backend().buffer();
+        (0..h)
+            .map(|y| {
+                let row: String = (0..w).map(|x| buf[(x, y)].symbol()).collect();
+                row.trim_end().to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn attachment_rows_and_prompt_render_above_the_footer() {
+        let png = temp_png("render.png");
+        let mut c = ComposeState::blank(DEFAULT_MAX_CHARS);
+        type_text(&mut c, "hello");
+        let req = attach(&mut c, &png, "a cat");
+        c.on_upload_result(req.local_id, Ok(MediaId::new("m1")));
+        press(&mut c, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        type_text(&mut c, "~/pic");
+
+        let name = png.file_name().unwrap().to_string_lossy().into_owned();
+        let out = screen(&mut c);
+        let lines: Vec<&str> = out.lines().collect();
+        let row = |needle: &str| lines.iter().position(|l| l.contains(needle));
+        let att = row(&format!("[img] {name}  ·  ready  ·  alt: a cat")).expect(&out);
+        let prompt = row("attach file › ~/pic").expect(&out);
+        let footer = row("visibility:").expect(&out);
+        assert!(att < prompt && prompt < footer, "{out}");
+        assert!(row("Ctrl+A attach").is_some(), "{out}");
+        let _ = std::fs::remove_file(png);
     }
 }

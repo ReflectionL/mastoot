@@ -17,11 +17,11 @@ compose / reply / quote / delete, favourite / boost / bookmark, follow lists,
 multi-account switching, inline images (kitty / iTerm2 / Sixel / halfblocks),
 SSE live updates with polling fallback, Apple Music link cards, polls,
 link previews, search (accounts · hashtags · posts), threaded replies with
-reply previews, favourites / bookmarks, post editing, Markdown-style
+reply previews, favourites / bookmarks, post editing, attaching images
+and video with alt text, grouped like / boost notifications, Markdown-style
 formatting from forks that send it.
 
-Not done: custom-emoji images (shortcodes show dimmed), media upload,
-lists, voting.
+Not done: custom-emoji images (shortcodes show dimmed), lists, voting.
 
 ## Quick start
 
@@ -123,6 +123,8 @@ Press `?` in the app for the same list.
 | `Esc` | cancel (asks first if there is a draft) |
 | `Ctrl+W` | cycle visibility |
 | `Ctrl+S` | toggle content warning |
+| `Ctrl+A` | attach a file (path, then optional alt text) |
+| `Ctrl+X` | remove the last attachment |
 | `Tab` | switch between body and content warning |
 <!-- keys:end -->
 

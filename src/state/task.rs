@@ -25,7 +25,7 @@ use crate::api::endpoints::{
     AccountListParams, AccountStatusesParams, NotificationParams, StatusDraft, TimelineParams,
 };
 use crate::api::error::ApiErrorCategory;
-use crate::api::models::{AccountId, Status, StatusId, Visibility as ApiVisibility};
+use crate::api::models::{AccountId, MediaId, Status, StatusId, Visibility as ApiVisibility};
 use crate::api::streaming::{StreamEvent, UserStream};
 use crate::api::{ApiError, MastodonClient};
 use crate::state::app::{AppState, Shared, lock};
@@ -281,8 +281,10 @@ async fn handle_action(ctx: Ctx, action: Action) {
             sensitive,
             visibility,
             edit_of,
+            media_ids,
         } => {
             let mut draft = StatusDraft::new(text);
+            draft.media_ids = media_ids;
             draft.in_reply_to_id = in_reply_to_id;
             draft.quote_id = quote_id;
             draft.spoiler_text = content_warning;
@@ -300,6 +302,14 @@ async fn handle_action(ctx: Ctx, action: Action) {
                 // status shows up immediately.
                 load_timeline(&ctx, TimelineKind::Home, None, false).await;
             }
+        }
+        Action::UploadMedia {
+            local_id,
+            path,
+            alt,
+        } => {
+            let result = upload_media(&ctx, &path, alt).await;
+            send(&ctx.events, Event::MediaUploaded { local_id, result }).await;
         }
         Action::LoadSource(id) => match ctx.client.status_source(&id).await {
             Ok(src) => {
@@ -914,6 +924,53 @@ async fn report_api_error(ctx: &Ctx, verb: &str, err: &ApiError) {
     )
     .await;
     note_api_error(ctx, err).await;
+}
+
+/// Largest file we will read into memory for an upload. Mastodon's own
+/// caps are lower (8–16 MB for images, ~100 MB for video on most
+/// instances); this only stops a mistyped path to a huge file from
+/// eating RAM before the server gets a say.
+const MAX_UPLOAD_BYTES: u64 = 128 * 1024 * 1024;
+
+/// Read `path`, upload it and wait for server-side processing.
+/// Errors are returned as the sentence the compose screen will toast.
+async fn upload_media(
+    ctx: &Ctx,
+    path: &std::path::Path,
+    alt: Option<String>,
+) -> Result<MediaId, String> {
+    let mime = crate::api::endpoints::mime_for_path(path)
+        .ok_or_else(|| "unsupported file type".to_string())?;
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| format!("can't read file · {e}"))?;
+    if !meta.is_file() {
+        return Err("not a file".into());
+    }
+    if meta.len() > MAX_UPLOAD_BYTES {
+        return Err("file too large".into());
+    }
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("can't read file · {e}"))?;
+    let filename = path
+        .file_name()
+        .map_or_else(|| "upload".into(), |n| n.to_string_lossy().into_owned());
+    match ctx
+        .client
+        .upload_media_ready(bytes, filename, mime, alt)
+        .await
+    {
+        Ok(m) => {
+            note_api_ok(ctx).await;
+            Ok(m.id)
+        }
+        Err(e) => {
+            warn!(?e, "media upload failed");
+            note_api_error(ctx, &e).await;
+            Err(e.terse())
+        }
+    }
 }
 
 /// `PUT /statuses/{id}`. The server returns the edited status, which

@@ -189,6 +189,16 @@ impl App {
                             self.mode = Mode::ComposeConfirmDiscard(state);
                         }
                     }
+                    ComposeOutcome::Upload(req) => {
+                        self.mode = Mode::Compose(state);
+                        let _ = tx
+                            .send(Action::UploadMedia {
+                                local_id: req.local_id,
+                                path: req.path,
+                                alt: req.alt,
+                            })
+                            .await;
+                    }
                     ComposeOutcome::Submit(draft) => {
                         let was_reply = draft.in_reply_to_id.is_some();
                         let _ = tx
@@ -200,6 +210,7 @@ impl App {
                                 sensitive: draft.sensitive,
                                 visibility: draft.visibility,
                                 edit_of: draft.edit_of,
+                                media_ids: draft.media_ids,
                             })
                             .await;
                         // If we came from a detail page and this was a
