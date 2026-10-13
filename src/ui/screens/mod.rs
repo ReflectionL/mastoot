@@ -1,4 +1,4 @@
-//! One module per top-level screen. Phase 2 work.
+//! One module per top-level screen.
 
 pub mod account_list;
 pub mod account_switcher;

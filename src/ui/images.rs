@@ -13,7 +13,7 @@
 //! whole module degrades gracefully — `ensure_loaded` becomes a
 //! no-op and rendering callers see `None` from `get_mut`.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::io::Cursor;
 
 use image::ImageReader;
@@ -29,6 +29,7 @@ use tracing::{debug, warn};
 
 use crate::api::models::MediaId;
 use crate::ui::widgets::status_card::ImageOverlay;
+use crate::util::lru::LruMap;
 
 /// Channel back-pressure cap. We rarely have more than a dozen images
 /// in flight, but reblogs and reload-bursts can queue more.
@@ -49,6 +50,12 @@ type Completion = (MediaId, Result<image::DynamicImage, String>);
 /// the first pictures appear sooner than with a thundering herd.
 const MAX_CONCURRENT_DOWNLOADS: usize = 4;
 
+/// Decoded images kept in memory. A screenful is a handful of pictures;
+/// this leaves room to scroll back a good way without re-downloading,
+/// while a multi-hour session can no longer grow without bound. Evicted
+/// images are simply fetched again if they scroll back into view.
+const MAX_CACHED_IMAGES: usize = 96;
+
 fn download_gate() -> &'static Arc<Semaphore> {
     static GATE: OnceLock<Arc<Semaphore>> = OnceLock::new();
     GATE.get_or_init(|| Arc::new(Semaphore::new(MAX_CONCURRENT_DOWNLOADS)))
@@ -57,7 +64,7 @@ fn download_gate() -> &'static Arc<Semaphore> {
 pub struct ImageCache {
     picker: Option<Picker>,
     init_status: String,
-    cache: HashMap<MediaId, StatefulProtocol>,
+    cache: LruMap<MediaId, StatefulProtocol>,
     pending: HashSet<MediaId>,
     /// Permanently failed downloads — don't retry on every render.
     failed: HashSet<MediaId>,
@@ -114,7 +121,7 @@ impl ImageCache {
         Self {
             picker,
             init_status: status,
-            cache: HashMap::new(),
+            cache: LruMap::new(MAX_CACHED_IMAGES),
             pending: HashSet::new(),
             failed: HashSet::new(),
             tx,
@@ -139,7 +146,7 @@ impl ImageCache {
         Self {
             picker: None,
             init_status: "images: off (config)".into(),
-            cache: HashMap::new(),
+            cache: LruMap::new(MAX_CACHED_IMAGES),
             pending: HashSet::new(),
             failed: HashSet::new(),
             tx,
