@@ -193,6 +193,13 @@ against a live account. Each rebuilt binary re-triggers the macOS Keychain
 prompt; `scripts/codesign-dev.sh` signs it with a self-signed identity so the
 approval sticks (setup steps in the script).
 
+## Releasing
+
+Bump `version` in `Cargo.toml` in a PR and merge it. The `Auto tag` workflow
+creates `vX.Y.Z` on main and starts the cargo-dist `Release` workflow, which
+builds the four platform archives, the shell installer and the Homebrew
+formula and attaches them to a GitHub Release.
+
 ## License
 
 Dual-licensed under MIT or Apache-2.0, at your option.
