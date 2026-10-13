@@ -23,7 +23,26 @@ formatting from forks that send it.
 
 Not done: custom-emoji images (shortcodes show dimmed), lists, voting.
 
-## Quick start
+## Install
+
+Pre-built binaries (macOS and Linux, Intel and ARM) are attached to every
+[release](https://github.com/ReflectionL/mastoot/releases). No Rust needed:
+
+```bash
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/ReflectionL/mastoot/releases/latest/download/mastoot-installer.sh | sh
+```
+
+or, with Homebrew:
+
+```bash
+brew install ReflectionL/mastoot/mastoot
+```
+
+To update, run `mastoot update` (add `--check` to only look). It works for
+copies put in place by the installer above; Homebrew users run
+`brew upgrade mastoot` instead.
+
+## Build from source
 
 ```bash
 git clone git@github.com:ReflectionL/mastoot.git && cd mastoot
@@ -40,7 +59,7 @@ on macOS; tokens are never written to it.
 macOS asks once whether mastoot may read the keychain — choose **Always
 Allow**, or it asks again on every launch.
 
-Other subcommands: `login`, `logout`, `whoami`, `accounts`, `switch <handle>`.
+Other subcommands: `login`, `logout`, `whoami`, `accounts`, `switch <handle>`, `update`.
 
 ### Headless / over SSH
 
