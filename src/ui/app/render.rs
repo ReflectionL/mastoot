@@ -486,51 +486,7 @@ impl App {
     }
 
     pub(super) fn render_help_overlay(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
-        let help_lines = vec![
-            "mastoot — keys",
-            "",
-            "  Esc           quit (asks first) · Ctrl+C quits at once",
-            "  ?             toggle this help",
-            "  1 / 2 / 3 / 4 / 5  Home / Local / Federated / Notifications / Profile",
-            "  6 / 7         Favourites / Bookmarks",
-            "  u             open profile of selected post's author",
-            "  F             (in other-user profile) follow / unfollow",
-            "  o / O         (in profile) open followers / following list",
-            "",
-            "  j / ↓         next post",
-            "  k / ↑         previous post",
-            "  gg / G        top / bottom",
-            "  R             refresh timeline",
-            "",
-            "  f             favourite / unfavourite",
-            "  b             boost / unboost",
-            "  B             force unboost",
-            "  c             new post",
-            "  r             reply to selected",
-            "  q             quote selected (Mastodon 4.5+ native quote)",
-            "  d             delete own post (Enter / Esc to confirm)",
-            "  e             edit own post",
-            "  l / Enter     open thread (status detail)",
-            "  Q             open quoted post (when selected post is a quote)",
-            "  o             open in browser (in profile: followers)",
-            "  y             copy link of selected post",
-            "  /             search accounts · hashtags · posts",
-            "  h / Esc       (in detail) back to timeline",
-            "  s             reveal / hide CW body for selected post",
-            "  D             toggle inter-post density (1 ↔ 2 blank lines)",
-            "  S             cycle live updates: streaming · polling · off",
-            "  A             switch account",
-            "  Tab / S-Tab   (in notifications) cycle filter",
-            "",
-            "  in compose mode",
-            "    Ctrl+Enter   send  (Alt+Enter / Ctrl+D also work)",
-            "    Esc          cancel (confirm if draft non-empty)",
-            "    Ctrl+W       cycle visibility",
-            "    Ctrl+S       toggle content warning",
-            "    Tab          toggle focus body ↔ CW field",
-            "",
-            "  (press any key to dismiss)",
-        ];
+        let help_lines = crate::ui::keymap::help_lines();
         // Fit the box to the longest line (+ borders + a little air)
         // instead of a fixed width, so no entry gets clipped.
         let longest = help_lines
@@ -552,7 +508,7 @@ impl App {
         };
         let lines: Vec<Line<'static>> = help_lines
             .into_iter()
-            .map(|s| Line::from(Span::styled(s.to_string(), self.theme.primary())))
+            .map(|s| Line::from(Span::styled(s, self.theme.primary())))
             .collect();
         frame.render_widget(ratatui::widgets::Clear, rect);
         let block = ratatui::widgets::Block::new()
