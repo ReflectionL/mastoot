@@ -4,6 +4,7 @@
 
 pub mod app;
 pub mod images;
+pub mod keymap;
 pub mod screens;
 #[cfg(test)]
 mod snapshots;

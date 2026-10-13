@@ -17,11 +17,11 @@ compose / reply / quote / delete, favourite / boost / bookmark, follow lists,
 multi-account switching, inline images (kitty / iTerm2 / Sixel / halfblocks),
 SSE live updates with polling fallback, Apple Music link cards, polls,
 link previews, search (accounts · hashtags · posts), threaded replies with
-reply previews, favourites / bookmarks, post editing, Markdown-style
+reply previews, favourites / bookmarks, post editing, attaching images
+and video with alt text, grouped like / boost notifications, Markdown-style
 formatting from forks that send it.
 
-Not done: custom-emoji images (shortcodes show dimmed), media upload,
-lists, voting.
+Not done: custom-emoji images (shortcodes show dimmed), lists, voting.
 
 ## Quick start
 
@@ -59,29 +59,74 @@ Two things differ on a server without a desktop:
 
 ## Keys
 
+Press `?` in the app for the same list.
+
+<!-- keys:start (generated from src/ui/keymap.rs) -->
+
+**Anywhere**
+
 | Key | Action |
 | --- | --- |
-| `1` `2` `3` `4` `5` | Home / Local / Federated / Notifications / your profile |
+| `?` | toggle this help |
+| `Esc` | back; at the top level asks before quitting |
+| `Ctrl+C` | quit at once |
+| `1` `2` `3` `4` | Home / Local / Federated / Notifications |
+| `5` | your profile |
 | `6` `7` | your favourites / bookmarks |
-| `j` `k` `gg` `G` | move · top · bottom |
-| `l` `Enter` | open thread |
-| `h` `Esc` | back (at the top level, `Esc` asks before quitting; `Ctrl+C` quits at once) |
-| `f` `b` `B` | favourite · boost · force un-boost |
-| `c` `r` `q` | new post · reply · quote |
-| `d` `e` | delete / edit your own post |
-| `u` | author's profile |
-| `o` `y` | open in browser · copy link |
-| `Q` | open the quoted post |
-| `/` | search accounts, hashtags and posts (`Enter` on a hashtag opens its timeline) |
-| `s` | reveal / hide a content warning |
-| `R` | refresh |
-| `S` `D` `A` | live-update mode · density · switch account |
-| `Tab` | cycle notification filter |
-| `F` `o` `O` | in a profile: follow · followers · following |
-| `?` | help |
+| `/` | search accounts · hashtags · posts |
+| `A` | switch account |
+| `S` | cycle live updates: streaming · polling · off |
+| `D` | toggle inter-post density (1 ↔ 2 blank lines) |
 
-Compose: `Ctrl+Enter` send (also `Alt+Enter` / `Ctrl+D`), `Ctrl+W` visibility,
-`Ctrl+S` content warning, `Tab` switch field, `Esc` cancel.
+**Moving around**
+
+| Key | Action |
+| --- | --- |
+| `j` `↓` | next post |
+| `k` `↑` | previous post |
+| `gg` `G` | top / bottom |
+| `R` | refresh |
+| `l` `Enter` | open thread |
+| `h` `Esc` | back |
+| `Q` | open the quoted post |
+| `s` | reveal / hide a content warning |
+| `Tab` `Shift+Tab` | cycle the notification filter |
+
+**On a post**
+
+| Key | Action |
+| --- | --- |
+| `f` | favourite / unfavourite |
+| `b` | boost / unboost |
+| `B` | force un-boost |
+| `c` | new post |
+| `r` | reply |
+| `q` | quote (Mastodon 4.5+ native quote) |
+| `e` | edit your own post |
+| `d` | delete your own post (Enter confirms) |
+| `u` | author's profile |
+| `o` | open in browser |
+| `y` | copy link |
+
+**In a profile**
+
+| Key | Action |
+| --- | --- |
+| `F` | follow / unfollow |
+| `o` `O` | followers / following |
+
+**Composing**
+
+| Key | Action |
+| --- | --- |
+| `Ctrl+Enter` | send (Alt+Enter and Ctrl+D also work) |
+| `Esc` | cancel (asks first if there is a draft) |
+| `Ctrl+W` | cycle visibility |
+| `Ctrl+S` | toggle content warning |
+| `Ctrl+A` | attach a file (path, then optional alt text) |
+| `Ctrl+X` | remove the last attachment |
+| `Tab` | switch between body and content warning |
+<!-- keys:end -->
 
 `Ctrl+Enter` needs the kitty keyboard protocol — WezTerm, kitty, Ghostty,
 foot, Konsole and iTerm2 (with CSI-u enabled) all support it. On other

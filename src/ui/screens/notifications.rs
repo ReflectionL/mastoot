@@ -6,8 +6,11 @@
 //! Mastodon API call simple (no `types[]=…` round-trips on Tab) and
 //! lets the user flip filters instantly without waiting on the wire.
 //!
-//! Selection traverses *visible* notifications only; cycling the
-//! filter resets the cursor so it always lands on something on-screen.
+//! Likes and boosts of the same post collapse into one row ("Alice, Bob
+//! and 3 others favourited your post"). Grouping is a view concern —
+//! `items` stays the flat server order — and the group sits where its
+//! newest member is. Selection traverses *groups*; cycling the filter
+//! resets the cursor so it always lands on something on-screen.
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use ratatui::Frame;
@@ -16,7 +19,9 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Padding, Paragraph};
 
-use crate::api::models::{Notification, NotificationType, Status};
+use std::collections::HashMap;
+
+use crate::api::models::{Notification, NotificationId, NotificationType, Status};
 use crate::state::{Action, TimelineKind};
 use crate::ui::Theme;
 use crate::ui::widgets::notification_card;
@@ -101,6 +106,11 @@ pub struct NotificationsScreen {
     pub load_more_pending: bool,
     known_len: usize,
     pub exhausted: bool,
+    /// Id of the newest notification in the selected group. Lets the
+    /// cursor follow what the user is looking at when new items land
+    /// above it (a fresh favourite may merge into an existing group
+    /// instead of adding a row).
+    anchor: Option<NotificationId>,
 }
 
 impl Default for NotificationsScreen {
@@ -120,6 +130,7 @@ impl NotificationsScreen {
             load_more_pending: false,
             known_len: 0,
             exhausted: false,
+            anchor: None,
         }
     }
 
@@ -132,6 +143,7 @@ impl NotificationsScreen {
         self.load_more_pending = false;
         self.known_len = 0;
         self.exhausted = false;
+        self.anchor = None;
     }
 
     /// A `LoadMore` request errored out — allow a retry.
@@ -155,6 +167,38 @@ impl NotificationsScreen {
             .collect()
     }
 
+    /// Visible notifications folded into display groups, newest first.
+    /// Each group is a list of indexes into `items`, in server order;
+    /// the first entry is the representative. Only favourites and
+    /// boosts merge, and only when they target the same post.
+    pub fn groups(&self, items: &[Notification]) -> Vec<Vec<usize>> {
+        let mut groups: Vec<Vec<usize>> = Vec::new();
+        let mut by_key: HashMap<(NotificationType, String), usize> = HashMap::new();
+        for i in self.visible_indices(items) {
+            let n = &items[i];
+            let mergeable = matches!(
+                n.notification_type,
+                NotificationType::Favourite | NotificationType::Reblog
+            );
+            let key = n
+                .status
+                .as_ref()
+                .filter(|_| mergeable)
+                .map(|st| (n.notification_type, st.id.to_string()));
+            if let Some(k) = key {
+                if let Some(&g) = by_key.get(&k) {
+                    groups[g].push(i);
+                } else {
+                    by_key.insert(k, groups.len());
+                    groups.push(vec![i]);
+                }
+            } else {
+                groups.push(vec![i]);
+            }
+        }
+        groups
+    }
+
     pub fn on_items_changed(&mut self, len: usize, appended: bool) {
         if appended {
             if len == self.known_len {
@@ -172,29 +216,41 @@ impl NotificationsScreen {
         self.load_more_pending = false;
     }
 
-    /// Streaming-style prepend: `count` fresh notifications landed at
-    /// the top. Bump the selected index so the cursor sticks to the
-    /// thing the user was looking at.
-    pub fn on_prepended(&mut self, count: usize, new_len: usize) {
-        if count == 0 || new_len == 0 {
+    /// Streaming-style prepend: fresh notifications landed at the top
+    /// of `items`. Re-find the group the user was looking at so the
+    /// cursor sticks to it.
+    pub fn on_prepended(&mut self, items: &[Notification]) {
+        self.known_len = items.len();
+        let Some(anchor) = self.anchor.clone() else {
             return;
+        };
+        if let Some(g) = self
+            .groups(items)
+            .iter()
+            .position(|members| members.iter().any(|&i| items[i].id == anchor))
+        {
+            self.selected = g;
         }
-        let bumped = self.selected.saturating_add(count);
-        self.selected = bumped.min(new_len - 1);
-        self.known_len = new_len;
     }
 
-    /// Index into the full list of the currently selected *visible*
-    /// notification, if any.
+    /// Index into the full list of the selected group's representative
+    /// (newest) notification, if any.
     #[must_use]
     pub fn selected_index(&self, items: &[Notification]) -> Option<usize> {
-        self.visible_indices(items).get(self.selected).copied()
+        self.groups(items)
+            .get(self.selected)
+            .and_then(|g| g.first())
+            .copied()
+    }
+
+    fn remember_anchor(&mut self, items: &[Notification]) {
+        self.anchor = self.selected_index(items).map(|i| items[i].id.clone());
     }
 
     /// Driver. `items` is the full notifications list.
     pub fn handle_key(&mut self, key: KeyEvent, items: &[Notification]) -> NotifOutcome {
-        let visible = self.visible_indices(items);
-        let len = visible.len();
+        let groups = self.groups(items);
+        let len = groups.len();
         let reset_g = !matches!(key.code, KeyCode::Char('g'));
         let outcome = match key.code {
             KeyCode::Tab => {
@@ -240,7 +296,7 @@ impl NotificationsScreen {
                 NotifOutcome::Dispatch(Action::Refresh(TimelineKind::Notifications))
             }
             KeyCode::Char('l') | KeyCode::Enter => {
-                let real_idx = visible.get(self.selected).copied();
+                let real_idx = groups.get(self.selected).and_then(|g| g.first()).copied();
                 match real_idx
                     .and_then(|i| items.get(i))
                     .and_then(|n| n.status.as_ref())
@@ -254,6 +310,7 @@ impl NotificationsScreen {
         if reset_g {
             self.last_g = false;
         }
+        self.remember_anchor(items);
         outcome
     }
 
@@ -331,9 +388,11 @@ impl NotificationsScreen {
         self.render_filter_strip(frame, layout[0], theme);
 
         let body_area = layout[1];
-        let visible = self.visible_indices(items);
+        let groups = self.groups(items);
+        self.selected = self.selected.min(groups.len().saturating_sub(1));
+        self.remember_anchor(items);
 
-        if visible.is_empty() {
+        if groups.is_empty() {
             let msg = if items.is_empty() {
                 "loading notifications…"
             } else {
@@ -351,14 +410,16 @@ impl NotificationsScreen {
 
         let mut lines: Vec<Line<'static>> = Vec::new();
         let mut sel_range: (u16, u16) = (0, 0);
-        for (i, idx) in visible.iter().enumerate() {
+        for (i, members) in groups.iter().enumerate() {
             if i > 0 {
                 for _ in 0..notification_card::INTER_NOTIFICATION_BLANK_LINES {
                     lines.push(Line::default());
                 }
             }
-            let card = notification_card::render(
-                &items[*idx],
+            let others: Vec<&Notification> = members[1..].iter().map(|&j| &items[j]).collect();
+            let card = notification_card::render_group(
+                &items[members[0]],
+                &others,
                 theme,
                 i == self.selected,
                 prefs,
@@ -455,5 +516,80 @@ mod tests {
             NotifOutcome::Continue => {}
             _ => panic!("expected Continue (follow has no status)"),
         }
+    }
+
+    fn fake_on(kind: NotificationType, id: &str, status: &str) -> Notification {
+        let mut n = fake(kind, id);
+        n.status = Some(Status {
+            id: crate::api::models::StatusId::new(status),
+            ..Default::default()
+        });
+        n
+    }
+
+    #[test]
+    fn favourites_of_one_post_form_one_group() {
+        let items = vec![
+            fake_on(NotificationType::Favourite, "4", "p1"),
+            fake_on(NotificationType::Favourite, "3", "p2"),
+            fake_on(NotificationType::Favourite, "2", "p1"),
+            fake_on(NotificationType::Reblog, "1", "p1"),
+        ];
+        let s = NotificationsScreen::new();
+        // p1 favourites merge (even though p2 sits between them); the
+        // boost of p1 is a different action and stays separate.
+        assert_eq!(s.groups(&items), vec![vec![0, 2], vec![1], vec![3]]);
+    }
+
+    #[test]
+    fn mentions_and_follows_never_merge() {
+        let items = vec![
+            fake_on(NotificationType::Mention, "3", "p1"),
+            fake_on(NotificationType::Mention, "2", "p1"),
+            fake(NotificationType::Follow, "1"),
+        ];
+        let s = NotificationsScreen::new();
+        assert_eq!(s.groups(&items).len(), 3);
+    }
+
+    #[test]
+    fn cursor_moves_by_group_and_enter_opens_the_post() {
+        let items = vec![
+            fake_on(NotificationType::Favourite, "3", "p1"),
+            fake_on(NotificationType::Favourite, "2", "p1"),
+            fake_on(NotificationType::Mention, "1", "p2"),
+        ];
+        let mut s = NotificationsScreen::new();
+        s.handle_key(key(KeyCode::Char('j'), KeyModifiers::NONE), &items);
+        assert_eq!(s.selected, 1);
+        assert_eq!(s.selected_index(&items), Some(2));
+        match s.handle_key(key(KeyCode::Enter, KeyModifiers::NONE), &items) {
+            NotifOutcome::OpenStatus(st) => assert_eq!(st.id.as_str(), "p2"),
+            _ => panic!("expected OpenStatus"),
+        }
+    }
+
+    #[test]
+    fn prepend_that_merges_keeps_cursor_on_the_same_group() {
+        let mut items = vec![
+            fake_on(NotificationType::Mention, "2", "p2"),
+            fake_on(NotificationType::Favourite, "1", "p1"),
+        ];
+        let mut s = NotificationsScreen::new();
+        s.handle_key(key(KeyCode::Char('j'), KeyModifiers::NONE), &items);
+        assert_eq!(s.selected, 1); // the favourite group
+
+        // A new favourite of p1 lands on top: it joins that group, so
+        // no row is added and the cursor must not move.
+        items.insert(0, fake_on(NotificationType::Favourite, "3", "p1"));
+        s.on_prepended(&items);
+        assert_eq!(s.groups(&items), vec![vec![0, 2], vec![1]]);
+        assert_eq!(s.selected, 0);
+        assert_eq!(s.selected_index(&items), Some(0));
+
+        // A brand-new mention adds a row above the group instead.
+        items.insert(0, fake_on(NotificationType::Mention, "4", "p3"));
+        s.on_prepended(&items);
+        assert_eq!(s.selected, 1);
     }
 }

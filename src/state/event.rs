@@ -5,7 +5,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::ApiErrorCategory;
 use crate::api::models::{
-    Account, AccountId, Notification, Relationship, SearchResults, Status, StatusId, StatusSource,
+    Account, AccountId, MediaId, Notification, Relationship, SearchResults, Status, StatusId,
+    StatusSource,
 };
 use crate::state::TimelineKind;
 
@@ -68,6 +69,16 @@ pub enum Action {
         /// `Some(id)` → `PUT /statuses/{id}` (edit) instead of a new
         /// post.
         edit_of: Option<StatusId>,
+        /// Already-uploaded attachments, in display order.
+        media_ids: Vec<MediaId>,
+    },
+    /// Upload the file at `path` for the compose screen. `local_id` is
+    /// the compose screen's handle for this attachment; the answer
+    /// comes back as [`Event::MediaUploaded`] carrying the same id.
+    UploadMedia {
+        local_id: u64,
+        path: std::path::PathBuf,
+        alt: Option<String>,
     },
     /// Fetch the original text of one of the user's own posts so it
     /// can be edited.
@@ -128,6 +139,12 @@ pub enum Event {
         status: Status,
     },
     StatusUpdated(Status),
+    /// An [`Action::UploadMedia`] finished (the server has processed
+    /// the file) or failed with a human-readable reason.
+    MediaUploaded {
+        local_id: u64,
+        result: Result<MediaId, String>,
+    },
     StatusDeleted(StatusId),
     /// `/api/v1/notifications` fetched. `appended` matches the timeline
     /// semantics — `false` replaces, `true` appends older entries.

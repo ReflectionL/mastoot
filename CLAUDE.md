@@ -96,6 +96,7 @@ mastoot/
 │       ├── app.rs              # 入口 / App 结构体 / 模式栈 / 主循环
 │       ├── app/                # input.rs 按键 · events.rs 事件折叠 · render.rs 整帧渲染
 │       ├── theme.rs            # 配色和字体层次
+│       ├── keymap.rs           # 键位表（帮助浮层 + README 共用，测试守护）
 │       ├── screens/
 │       │   ├── timeline.rs
 │       │   ├── status_detail.rs
@@ -349,6 +350,8 @@ Theme {
 | `Esc` | 取消（有确认弹窗） |
 | `Ctrl+W` | 设置可见性 |
 | `Ctrl+S` | 切换敏感内容标记 |
+| `Ctrl+A` | 附加文件（路径 → alt text） |
+| `Ctrl+X` | 移除最后一个附件 |
 
 ## 8. 代码规范
 
@@ -450,6 +453,9 @@ cargo run --example fetch_home
 
 ### Phase 5  多账号 + quote 完整链路  ·  2026-04-18
 
+- 发帖带附件 · 2026-10-13 — compose `Ctrl+A` 附件（路径 → alt text）/ `Ctrl+X` 删除；`Action::UploadMedia` / `Event::MediaUploaded`；`upload_media_ready` 轮询服务端处理；最多 4 个，编辑模式禁用
+- 通知合并 · 2026-10-13 — 同一帖的点赞 / 转发折成一行（`Alice, Bob and 3 others favourited your post`）；`NotificationsScreen::groups()` + `notification_card::render_group`；游标按组走，新通知按 anchor id 找回所属组
+- 键位表 · 2026-10-13 — 新 `ui/keymap.rs` 作为帮助浮层和 README 键位表的唯一来源，`readme_key_table_matches_keymap` 测试防漂移
 - 整理 · 2026-10-13 — 补建 `UPDATE_LOG.md`；删四个空壳 widget 模块；`ui/app.rs` 拆成 `app/{input,events,render}.rs`；`ImageCache` 改用 `util::lru::LruMap`（上限 96 张）
 - 第三轮 · 2026-09-15 — 线程页回复树缩进（按 `in_reply_to_id` 算深度，2 列/级封顶 4 级）；真正的 reply preview `↪ @acct: "…"`（同列表 + `parents` 缓存 + `Action::LoadStatus` 按需拉）；图片占位按宽高比；`TestBackend` 快照测试 `ui/snapshots.rs`；解码进 `spawn_blocking` + 下载 4 并发；`6`/`7` 收藏 / 书签 tab；`e` 编辑帖子（`/source` + PUT）；`scripts/tui_snapshot.py` + `codesign-dev.sh`
 - 优化第二轮 · 2026-09-14 — `/` 搜索（prompt 行内输入 + accounts / hashtags / posts 结果页 + 标签时间线复用同一 screen）；自定义 emoji 短码 `:x:` 降 tertiary（`widgets/shortcode.rs`）；全局密度 atomic 换成 `status_card::RenderPrefs` 传参；通知摘要跳空行；依赖升级 toml 1 / directories 6 / rand 0.10 / scraper 0.27

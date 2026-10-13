@@ -494,4 +494,41 @@ mod tests {
             "{e:?}"
         );
     }
+
+    #[tokio::test]
+    async fn upload_waits_for_server_side_processing() {
+        let pending = r#"{"id":"7","type":"video","url":null}"#;
+        let done = r#"{"id":"7","type":"video","url":"https://ex.com/v.mp4"}"#;
+        let (base, mut reqs) = serve(vec![
+            http_response("202 Accepted", &[], pending),
+            http_response("206 Partial Content", &[], pending),
+            http_response("200 OK", &[], done),
+        ])
+        .await;
+        let client = MastodonClient::new(&base, SecretString::from("tok".to_string())).unwrap();
+        let media = client
+            .upload_media_ready_every(
+                b"x".to_vec(),
+                "v.mp4",
+                "video/mp4",
+                Some("alt".into()),
+                Duration::from_millis(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(media.url.as_deref(), Some("https://ex.com/v.mp4"));
+        assert!(reqs.recv().await.unwrap().starts_with("POST /api/v2/media"));
+        assert!(
+            reqs.recv()
+                .await
+                .unwrap()
+                .starts_with("GET /api/v1/media/7")
+        );
+        assert!(
+            reqs.recv()
+                .await
+                .unwrap()
+                .starts_with("GET /api/v1/media/7")
+        );
+    }
 }

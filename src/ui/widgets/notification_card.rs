@@ -8,6 +8,9 @@
 //!   a dim excerpt of the linked status (first ~3 wrapped lines).
 //! - Follow / follow-request / admin types render only the action line.
 //!
+//! Several favourites / boosts of one post can arrive as a *group*: the
+//! header then names the first two people and counts the rest.
+//!
 //! No metric counts here — the linked status detail page is the place
 //! to expand. Notifications stay scannable.
 
@@ -34,14 +37,55 @@ pub fn render(
     prefs: RenderPrefs,
     width: u16,
 ) -> Vec<Line<'static>> {
-    let body = build_lines(n, theme, prefs, width.saturating_sub(2));
+    render_group(n, &[], theme, selected, prefs, width)
+}
+
+/// Like [`render`], for a group: `n` is the newest notification and
+/// `others` the older ones that target the same post with the same
+/// action. With no `others` this is exactly [`render`].
+#[must_use]
+pub fn render_group(
+    n: &Notification,
+    others: &[&Notification],
+    theme: &Theme,
+    selected: bool,
+    prefs: RenderPrefs,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let body = build_lines(n, others, theme, prefs, width.saturating_sub(2));
     body.into_iter()
         .map(|l| with_gutter(l, theme, selected))
         .collect()
 }
 
+fn display_name(n: &Notification) -> String {
+    emoji::normalize_owned(&if n.account.display_name.is_empty() {
+        n.account.username.clone()
+    } else {
+        n.account.display_name.clone()
+    })
+}
+
+/// "Alice", "Alice and Bob", "Alice, Bob and 3 others".
+fn group_names(n: &Notification, others: &[&Notification]) -> String {
+    match others {
+        [] => display_name(n),
+        [one] => format!("{} and {}", display_name(n), display_name(one)),
+        [one, rest @ ..] => {
+            let count = rest.len();
+            let noun = if count == 1 { "other" } else { "others" };
+            format!(
+                "{}, {} and {count} {noun}",
+                display_name(n),
+                display_name(one)
+            )
+        }
+    }
+}
+
 fn build_lines(
     n: &Notification,
+    others: &[&Notification],
     theme: &Theme,
     prefs: RenderPrefs,
     inner_width: u16,
@@ -50,11 +94,7 @@ fn build_lines(
     let absolute_time = prefs.absolute_time;
     let mut out: Vec<Line<'static>> = Vec::new();
 
-    let display = emoji::normalize_owned(&if n.account.display_name.is_empty() {
-        n.account.username.clone()
-    } else {
-        n.account.display_name.clone()
-    });
+    let display = group_names(n, others);
     let handle = emoji::normalize_owned(&format!("@{}", n.account.acct));
     let time = n
         .created_at
@@ -74,9 +114,12 @@ fn build_lines(
         Span::styled(display, theme.display_name()),
         Span::raw(" "),
         Span::styled(verb, theme.secondary()),
-        Span::raw("  "),
-        Span::styled(handle, theme.handle()),
     ];
+    // A group has no single handle to show; the names carry the line.
+    if others.is_empty() {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(handle, theme.handle()));
+    }
     if !time.is_empty() {
         spans.push(Span::styled("  ·  ", theme.timestamp()));
         spans.push(Span::styled(time, theme.timestamp()));
@@ -308,5 +351,27 @@ mod tests {
             .map(|c| UnicodeWidthChar::width(c).unwrap_or(0))
             .sum();
         assert_eq!(cols, 2);
+    }
+
+    #[test]
+    fn group_header_names_people_and_counts_the_rest() {
+        let theme = Theme::frost();
+        let named = |name: &str| {
+            let mut n = fake_notif(NotificationType::Favourite);
+            n.account.display_name = name.into();
+            n
+        };
+        let (a, b, c, d) = (named("Alice"), named("Bob"), named("Cy"), named("Di"));
+
+        let two = render_group(&a, &[&b], &theme, false, RenderPrefs::default(), 80);
+        assert!(join(&two).contains("Alice and Bob favourited your post"));
+
+        let four = render_group(&a, &[&b, &c, &d], &theme, false, RenderPrefs::default(), 80);
+        assert!(join(&four).contains("Alice, Bob and 2 others favourited your post"));
+        // A group has no single handle.
+        assert!(!join(&four).contains("@alice@ex.com"));
+
+        let three = render_group(&a, &[&b, &c], &theme, false, RenderPrefs::default(), 80);
+        assert!(join(&three).contains("Alice, Bob and 1 other favourited"));
     }
 }

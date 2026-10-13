@@ -1,8 +1,8 @@
 //! Folding state-task [`Event`]s into the UI's own state.
 
 use super::{
-    Action, ApiHealth, App, ComposeState, Event, Mode, Status, TimelineKind, apply_revert,
-    missing_parents,
+    Action, ApiHealth, App, ComposeState, Event, Mode, Status, TimelineKind, ToastLevel,
+    apply_revert, missing_parents,
 };
 
 impl App {
@@ -313,6 +313,20 @@ impl App {
                 self.notifications_screen
                     .on_items_changed(self.notifications.len(), appended);
             }
+            Event::MediaUploaded { local_id, result } => {
+                // The compose screen may be showing, or sitting behind
+                // the discard-confirm; anywhere else the draft is gone
+                // and the answer has nobody to tell.
+                let (Mode::Compose(c) | Mode::ComposeConfirmDiscard(c)) = &mut self.mode else {
+                    return;
+                };
+                let failure = result.as_ref().err().cloned();
+                if c.on_upload_result(local_id, result)
+                    && let Some(why) = failure
+                {
+                    self.push_toast(ToastLevel::Error, format!("upload failed · {why}"));
+                }
+            }
             Event::NotificationReceived(n) => {
                 if self
                     .notifications
@@ -322,8 +336,7 @@ impl App {
                     return;
                 }
                 self.notifications.insert(0, n);
-                let len = self.notifications.len();
-                self.notifications_screen.on_prepended(1, len);
+                self.notifications_screen.on_prepended(&self.notifications);
             }
             Event::SearchResults { query, results } => {
                 if let Mode::Search(s) = &mut self.mode
