@@ -143,6 +143,10 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
+      # Hand edit (see allow-dirty in dist-workspace.toml)
+      - name: Install libdbus (keyring's Secret Service backend)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
       - name: Build artifacts
         run: |
           # Actually do builds and make zips and whatnot
