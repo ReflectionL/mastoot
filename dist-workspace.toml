@@ -19,5 +19,6 @@ publish-jobs = ["homebrew"]
 install-path = "CARGO_HOME"
 # Whether to install an updater program
 install-updater = false
-# release.yml carries a hand-added workflow_dispatch trigger (auto-tag.yml)
+# release.yml carries hand edits: a workflow_dispatch trigger (auto-tag.yml)
+# and a libdbus install step (keyring crate) before the Linux builds
 allow-dirty = ["ci"]
