@@ -21,5 +21,6 @@ async fn main() -> Result<()> {
         Command::Whoami => commands::whoami::run(&cli).await,
         Command::Accounts => commands::accounts::run(&cli).await,
         Command::Switch(args) => commands::switch::run(&cli, args).await,
+        Command::Update(args) => commands::update::run(args).await,
     }
 }

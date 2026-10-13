@@ -5,4 +5,5 @@ pub mod login;
 pub mod logout;
 pub mod run;
 pub mod switch;
+pub mod update;
 pub mod whoami;

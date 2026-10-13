@@ -52,6 +52,12 @@ pub enum Command {
 
     /// Switch the default account for the TUI.
     Switch(SwitchArgs),
+
+    /// Update mastoot to the latest GitHub release.
+    ///
+    /// Works for copies installed with the shell installer from the
+    /// release page. Homebrew users run `brew upgrade mastoot` instead.
+    Update(UpdateArgs),
 }
 
 #[derive(Debug, Args)]
@@ -73,4 +79,30 @@ pub struct SwitchArgs {
     /// Fully qualified handle, e.g. `alice@mastodon.social`. Must
     /// match one of the accounts listed by `mastoot accounts`.
     pub handle: String,
+}
+
+#[derive(Debug, Args)]
+pub struct UpdateArgs {
+    /// Only report whether a newer release exists; install nothing.
+    #[arg(long)]
+    pub check: bool,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn update_subcommand_parses() {
+        let cli = Cli::try_parse_from(["mastoot", "update", "--check"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Update(UpdateArgs { check: true }))
+        ));
+        let cli = Cli::try_parse_from(["mastoot", "update"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::Update(UpdateArgs { check: false }))
+        ));
+    }
 }
