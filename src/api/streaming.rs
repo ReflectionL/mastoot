@@ -72,16 +72,16 @@ impl UserStream {
     /// Open a user stream against the client's instance. The client must
     /// carry a token; anonymous streaming is rejected since Mastodon
     /// 4.2.
-    pub async fn open(client: &MastodonClient) -> ApiResult<Self> {
-        Self::open_endpoint(client, "/api/v1/streaming/user").await
+    pub fn open(client: &MastodonClient) -> ApiResult<Self> {
+        Self::open_endpoint(client, "/api/v1/streaming/user")
     }
 
     /// Open the notification-only stream.
-    pub async fn open_notification(client: &MastodonClient) -> ApiResult<Self> {
-        Self::open_endpoint(client, "/api/v1/streaming/user/notification").await
+    pub fn open_notification(client: &MastodonClient) -> ApiResult<Self> {
+        Self::open_endpoint(client, "/api/v1/streaming/user/notification")
     }
 
-    async fn open_endpoint(client: &MastodonClient, path: &str) -> ApiResult<Self> {
+    fn open_endpoint(client: &MastodonClient, path: &str) -> ApiResult<Self> {
         let token = client
             .token()
             .ok_or_else(|| ApiError::OAuth("streaming requires a user token".into()))?;
