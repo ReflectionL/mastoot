@@ -88,7 +88,7 @@ Press `?` in the app for the same list.
 | --- | --- |
 | `?` | toggle this help |
 | `Esc` | back; at the top level asks before quitting |
-| `Ctrl+C` | quit at once |
+| `Ctrl+C` | quit (asks first over an unsaved draft) |
 | `1` `2` `3` `4` | Home / Local / Federated / Notifications |
 | `5` | your profile |
 | `6` `7` | your favourites / bookmarks |
@@ -145,6 +145,7 @@ Press `?` in the app for the same list.
 | `Ctrl+O` | attach a file (path, then optional alt text) |
 | `Ctrl+X` | remove the last attachment |
 | `Tab` | switch between body and content warning |
+| `@…` `#…` | suggest accounts / hashtags: Tab takes, ↑↓ choose, Esc hides |
 
 **Editing text (compose, search, prompts)**
 
@@ -157,6 +158,8 @@ Press `?` in the app for the same list.
 | `⌥←` `⌥→` | move by word (also Alt+B / Alt+F, Ctrl+← / →) |
 | `⌘←` `⌘→` | start / end of line (also Ctrl+A / Ctrl+E) |
 | `⌘↑` `⌘↓` | start / end of the text |
+| `Ctrl+Z` `⌘Z` | undo (also Ctrl+_) |
+| `Ctrl+Y` `⇧⌘Z` | redo |
 
 <!-- keys:end -->
 

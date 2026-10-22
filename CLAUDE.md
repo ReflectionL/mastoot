@@ -321,7 +321,7 @@ Theme {
 | Key | Action |
 |-----|--------|
 | `?` | 帮助 |
-| `Esc` | 退出（顶层；有确认弹窗）· `Ctrl+C` 直接退出 |
+| `Esc` | 退出（顶层；有确认弹窗）· `Ctrl+C` 直接退出（compose 有改动时先确认） |
 | `1`/`2`/`3`/`4` | Home / Local / Federated / Notifications |
 | `5`/`6`/`7` | Profile / Favourites / Bookmarks |
 
@@ -362,6 +362,8 @@ macOS 键 + readline 兜底，同一动作接受所有常见终端编码。
 | `⌥⌦` / `Alt+D` · `⌘⌦` / `Ctrl+K` | 删后一个词 · 删到行尾 |
 | `⌥←/→` / `Alt+B/F` / `Ctrl+←/→` | 按词移动 |
 | `⌘←/→` / `Ctrl+A/E` · `⌘↑/↓` | 行首/尾 · 全文首/尾 |
+| `Ctrl+Z` / `⌘Z` / `Ctrl+_` · `Ctrl+Y` / `⇧⌘Z` | 撤销 · 重做（连续打字按词成组） |
+| `@…` / `#…` | 补全账号 / 标签：`Tab` 选中、`↑↓` 挑、`Esc` 收起 |
 
 ## 8. 代码规范
 
@@ -463,6 +465,7 @@ cargo run --example fetch_home
 
 ### Phase 5  多账号 + quote 完整链路  ·  2026-04-18
 
+- 撰写体验 · 2026-10-22 — compose 有改动时 `Ctrl+C` / `Esc` 先确认（`has_changes` 对比打开时的 prefill，回复的 `@author ` 不算改动；确认框里再按 `Ctrl+C` 直接退）；textarea 撤销/重做（快照栈 200 步，连续打字按词成组，粘贴/补全走 `checkpoint`）；`@` / `#` 补全（`Action::Complete` 在 state 层 250ms 防抖 + generation 计数，`/api/v2/search` 不 resolve，最多 5 条；`Tab` 接受、`↑↓` 选、`Esc` 收起）
 - 文本编辑 · 2026-10-22 — textarea 支持 macOS 删除/移动键（`⌥⌫` 删词、`⌘⌫` 删到行首、`⌥←/→` 按词跳等），兼容 ESC DEL / `Ctrl+W` / `Ctrl+U` / kitty `Super` 各种编码；词 = 字母数字串或 CJK 串；搜索和附件 prompt 共用 `edit_prompt`。为避让 readline 键，compose 可见性 `Ctrl+W`→`Ctrl+V`、附件 `Ctrl+A`→`Ctrl+O`。顺带：帮助浮层矮终端可 `j/k` 滚动；附件上限读实例 `max_media_attachments`（`compose::Limits`）；开 bracketed paste（timeline 里误粘贴不再触发 `f`/`b`/`d`，粘贴进 compose 一次插入）
 - 自动发版 · 2026-10-13 — main 上 `Cargo.toml` 版本号变化 → `auto-tag.yml` 建 `vX.Y.Z` tag 并 dispatch `release.yml`（手加 `workflow_dispatch`，`allow-dirty = ["ci"]`）
 - 自更新 · 2026-10-13 — `mastoot update [--check]`（`commands/update.rs`，内嵌 axoupdater，读 cargo-dist 安装回执）；无回执时提示 brew / 源码升级办法；README 加 Install 一节

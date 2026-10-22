@@ -32,10 +32,20 @@ impl App {
         key: KeyEvent,
         tx: &tokio::sync::mpsc::Sender<Action>,
     ) -> bool {
-        // Ctrl-C always quits (belt-and-suspenders: raw mode swallows
-        // SIGINT, so we must handle it at the key layer).
+        // Ctrl-C quits (raw mode swallows SIGINT, so it's handled at
+        // the key layer) — except over a draft with changes, where it
+        // asks first. A second Ctrl-C at that prompt quits regardless.
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
-            return false;
+            return match std::mem::replace(&mut self.mode, Mode::Timeline) {
+                Mode::Compose(state) if state.has_changes() => {
+                    self.mode = Mode::ComposeConfirmDiscard(state, true);
+                    true
+                }
+                other => {
+                    self.mode = other;
+                    false
+                }
+            };
         }
 
         // Splash swallows the rest — nothing to navigate until the
@@ -74,7 +84,10 @@ impl App {
         // literal `D` key in the body editor.
         if key.code == KeyCode::Char('D')
             && !key.modifiers.contains(KeyModifiers::CONTROL)
-            && !matches!(self.mode, Mode::Compose(_) | Mode::ComposeConfirmDiscard(_))
+            && !matches!(
+                self.mode,
+                Mode::Compose(_) | Mode::ComposeConfirmDiscard(..)
+            )
         {
             self.density = if self.density >= 2 { 1 } else { 2 };
             return true;
@@ -85,7 +98,10 @@ impl App {
         // doesn't eat a literal S in the body.
         if key.code == KeyCode::Char('S')
             && !key.modifiers.contains(KeyModifiers::CONTROL)
-            && !matches!(self.mode, Mode::Compose(_) | Mode::ComposeConfirmDiscard(_))
+            && !matches!(
+                self.mode,
+                Mode::Compose(_) | Mode::ComposeConfirmDiscard(..)
+            )
         {
             let next = self.stream_mode.cycle();
             self.stream_mode = next;
@@ -117,7 +133,7 @@ impl App {
             && !key.modifiers.contains(KeyModifiers::CONTROL)
             && !matches!(
                 self.mode,
-                Mode::Compose(_) | Mode::ComposeConfirmDiscard(_) | Mode::AccountSwitcher(_)
+                Mode::Compose(_) | Mode::ComposeConfirmDiscard(..) | Mode::AccountSwitcher(_)
             )
         {
             let accounts = self.cfg.accounts.clone();
@@ -203,15 +219,18 @@ impl App {
             Mode::Compose(mut state) => {
                 match state.handle_key(key) {
                     ComposeOutcome::Continue => {
+                        if let Some(query) = state.take_lookup() {
+                            let _ = tx.send(Action::Complete { query }).await;
+                        }
                         self.mode = Mode::Compose(state);
                     }
                     ComposeOutcome::Cancel => {
-                        if state.is_body_empty() {
+                        if state.has_changes() {
+                            self.mode = Mode::ComposeConfirmDiscard(state, false);
+                        } else {
                             // nothing to lose — bounce straight back to
                             // wherever we came from.
                             self.exit_compose(tx, false).await;
-                        } else {
-                            self.mode = Mode::ComposeConfirmDiscard(state);
                         }
                     }
                     ComposeOutcome::Upload(req) => {
@@ -249,8 +268,9 @@ impl App {
                 }
                 return true;
             }
-            Mode::ComposeConfirmDiscard(state) => {
+            Mode::ComposeConfirmDiscard(state, quit) => {
                 match key.code {
+                    KeyCode::Char('y' | 'Y') if quit => return false,
                     KeyCode::Char('y' | 'Y') => {
                         // discard — drop state, back to wherever.
                         self.exit_compose(tx, false).await;
@@ -260,7 +280,7 @@ impl App {
                         self.mode = Mode::Compose(state);
                     }
                     _ => {
-                        self.mode = Mode::ComposeConfirmDiscard(state);
+                        self.mode = Mode::ComposeConfirmDiscard(state, quit);
                     }
                 }
                 return true;

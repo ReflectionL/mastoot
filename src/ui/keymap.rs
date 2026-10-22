@@ -33,7 +33,7 @@ pub const SECTIONS: &[Section] = &[
         bindings: &[
             b("?", "toggle this help"),
             b("Esc", "back; at the top level asks before quitting"),
-            b("Ctrl+C", "quit at once"),
+            b("Ctrl+C", "quit (asks first over an unsaved draft)"),
             b("1 / 2 / 3 / 4", "Home / Local / Federated / Notifications"),
             b("5", "your profile"),
             b("6 / 7", "your favourites / bookmarks"),
@@ -90,6 +90,10 @@ pub const SECTIONS: &[Section] = &[
             b("Ctrl+O", "attach a file (path, then optional alt text)"),
             b("Ctrl+X", "remove the last attachment"),
             b("Tab", "switch between body and content warning"),
+            b(
+                "@… / #…",
+                "suggest accounts / hashtags: Tab takes, ↑↓ choose, Esc hides",
+            ),
         ],
     },
     Section {
@@ -102,6 +106,8 @@ pub const SECTIONS: &[Section] = &[
             b("⌥← / ⌥→", "move by word (also Alt+B / Alt+F, Ctrl+← / →)"),
             b("⌘← / ⌘→", "start / end of line (also Ctrl+A / Ctrl+E)"),
             b("⌘↑ / ⌘↓", "start / end of the text"),
+            b("Ctrl+Z / ⌘Z", "undo (also Ctrl+_)"),
+            b("Ctrl+Y / ⇧⌘Z", "redo"),
         ],
     },
 ];

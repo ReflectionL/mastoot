@@ -57,7 +57,10 @@ impl App {
             Event::StatusSource(src) => {
                 if let Some((id, vis)) = self.pending_edit.take()
                     && id == src.id
-                    && !matches!(self.mode, Mode::Compose(_) | Mode::ComposeConfirmDiscard(_))
+                    && !matches!(
+                        self.mode,
+                        Mode::Compose(_) | Mode::ComposeConfirmDiscard(..)
+                    )
                 {
                     self.push_mode(Mode::Compose(ComposeState::edit(src, vis, self.limits)));
                 }
@@ -113,6 +116,11 @@ impl App {
                     && state.focal_id() == &focal_id
                 {
                     state.on_context_loaded(ancestors, descendants);
+                }
+            }
+            Event::Completions { query, results } => {
+                if let Mode::Compose(c) = &mut self.mode {
+                    c.set_completions(&query, &results);
                 }
             }
             Event::InstanceLoaded {
@@ -327,7 +335,7 @@ impl App {
                 // The compose screen may be showing, or sitting behind
                 // the discard-confirm; anywhere else the draft is gone
                 // and the answer has nobody to tell.
-                let (Mode::Compose(c) | Mode::ComposeConfirmDiscard(c)) = &mut self.mode else {
+                let (Mode::Compose(c) | Mode::ComposeConfirmDiscard(c, _)) = &mut self.mode else {
                     return;
                 };
                 let failure = result.as_ref().err().cloned();

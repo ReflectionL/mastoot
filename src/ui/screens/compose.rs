@@ -47,7 +47,7 @@ use ratatui::widgets::Paragraph;
 
 use crate::api::endpoints::mime_for_path;
 use crate::api::html;
-use crate::api::models::{MediaId, StatusId, StatusSource};
+use crate::api::models::{MediaId, SearchResults, StatusId, StatusSource};
 use crate::icons;
 use crate::state::Visibility;
 use crate::ui::Theme;
@@ -127,6 +127,25 @@ pub struct UploadRequest {
     pub alt: Option<String>,
 }
 
+/// One autocomplete candidate under the body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Suggestion {
+    /// What replaces the token: `@acct` or `#tag`.
+    insert: String,
+    /// Dim text after it: display name, or recent use count.
+    detail: String,
+}
+
+/// Suggestions for the `@` / `#` token at the cursor.
+#[derive(Debug, Clone)]
+struct Completion {
+    items: Vec<Suggestion>,
+    selected: usize,
+}
+
+/// Most suggestions shown (and asked for) at once.
+const MAX_SUGGESTIONS: usize = 5;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Body,
@@ -154,6 +173,16 @@ pub struct ComposeState {
     /// One-shot message for the footer ("attachment limit reached (4)"); cleared
     /// by the next key.
     notice: Option<String>,
+    /// Suggestions for the token at the cursor, while there are any.
+    completion: Option<Completion>,
+    /// Last token sent off for lookup, so each is asked for once.
+    asked: Option<String>,
+    /// Token whose suggestions `Esc` waved away; they stay hidden while
+    /// the token only grows from it.
+    dismissed: Option<String>,
+    /// Body and CW as the screen opened (a reply's `@author `, an edit's
+    /// source), so leaving without changes doesn't ask to discard.
+    initial: (String, String),
 }
 
 /// Return value of [`ComposeState::handle_key`].
@@ -222,7 +251,7 @@ impl ComposeState {
             me.spoiler = TextArea::from_text(source.spoiler_text.trim());
         }
         me.edit_of = Some(source.id);
-        me
+        me.mark_pristine()
     }
 
     fn with(
@@ -249,11 +278,29 @@ impl ComposeState {
             next_local_id: 0,
             prompt: None,
             notice: None,
+            completion: None,
+            asked: None,
+            dismissed: None,
+            initial: (String::new(), String::new()),
         }
+        .mark_pristine()
+    }
+
+    /// Record the current text as "nothing to lose".
+    fn mark_pristine(mut self) -> Self {
+        self.initial = (self.body.text(), self.spoiler.text());
+        self
     }
 
     pub fn is_body_empty(&self) -> bool {
         self.body.is_empty()
+    }
+
+    /// Whether leaving now would lose anything the user did: typed or
+    /// deleted text, or attached files.
+    #[must_use]
+    pub fn has_changes(&self) -> bool {
+        (self.body.text(), self.spoiler.text()) != self.initial || !self.attachments.is_empty()
     }
 
     fn char_count(&self) -> usize {
@@ -427,6 +474,134 @@ impl ComposeState {
         };
     }
 
+    /// The `@mention` / `#hashtag` being typed at the body's cursor,
+    /// sigil included, if it's long enough to look up.
+    fn token_at_cursor(&self) -> Option<String> {
+        if self.focus != Focus::Body || self.prompt.is_some() {
+            return None;
+        }
+        let before = self.body.text_before_cursor();
+        let token = before
+            .rsplit(char::is_whitespace)
+            .next()
+            .filter(|t| !t.is_empty())?;
+        let ok = if let Some(rest) = token.strip_prefix('@') {
+            rest.chars().count() >= 2
+                && !rest.starts_with('@')
+                && rest
+                    .chars()
+                    .all(|c| c.is_alphanumeric() || matches!(c, '_' | '.' | '-' | '@'))
+        } else if let Some(rest) = token.strip_prefix('#') {
+            !rest.is_empty() && rest.chars().all(|c| c.is_alphanumeric() || c == '_')
+        } else {
+            false
+        };
+        ok.then(|| token.to_string())
+    }
+
+    /// The token to look up after the last key, if it hasn't been asked
+    /// for yet. Hides stale suggestions once there is no token.
+    pub fn take_lookup(&mut self) -> Option<String> {
+        let Some(token) = self.token_at_cursor() else {
+            self.completion = None;
+            self.asked = None;
+            self.dismissed = None;
+            return None;
+        };
+        if self
+            .dismissed
+            .as_ref()
+            .is_some_and(|d| token.starts_with(d.as_str()))
+        {
+            return None;
+        }
+        self.dismissed = None;
+        if self.asked.as_ref() == Some(&token) {
+            return None;
+        }
+        self.asked = Some(token.clone());
+        Some(token)
+    }
+
+    /// Lookup results for `query`; ignored unless it's still the token
+    /// at the cursor.
+    pub fn set_completions(&mut self, query: &str, results: &SearchResults) {
+        if self.token_at_cursor().as_deref() != Some(query) || self.dismissed.is_some() {
+            return;
+        }
+        let items: Vec<Suggestion> = if query.starts_with('@') {
+            results
+                .accounts
+                .iter()
+                .map(|a| Suggestion {
+                    insert: format!("@{}", a.acct),
+                    detail: a.display_name.clone(),
+                })
+                .collect()
+        } else {
+            results
+                .hashtags
+                .iter()
+                .map(|t| {
+                    let uses: u64 = t
+                        .history
+                        .iter()
+                        .filter_map(|h| h.uses.parse::<u64>().ok())
+                        .sum();
+                    Suggestion {
+                        insert: format!("#{}", t.name),
+                        detail: if uses > 0 {
+                            format!("{uses} posts this week")
+                        } else {
+                            String::new()
+                        },
+                    }
+                })
+                .collect()
+        };
+        self.completion = (!items.is_empty()).then(|| Completion {
+            items: items.into_iter().take(MAX_SUGGESTIONS).collect(),
+            selected: 0,
+        });
+    }
+
+    fn completion_visible(&self) -> bool {
+        self.completion.is_some() && self.focus == Focus::Body && self.prompt.is_none()
+    }
+
+    /// Keys that steer an open suggestion list: `Tab` takes the
+    /// highlighted one, `↑`/`↓` (or `Ctrl+P`/`Ctrl+N`) choose, `Esc`
+    /// hides the list. Returns false for every other key.
+    fn handle_completion_key(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(c) = self.completion.as_mut() else {
+            return false;
+        };
+        let n = c.items.len();
+        match key.code {
+            KeyCode::Down => c.selected = (c.selected + 1) % n,
+            KeyCode::Char('n') if ctrl => c.selected = (c.selected + 1) % n,
+            KeyCode::Up => c.selected = (c.selected + n - 1) % n,
+            KeyCode::Char('p') if ctrl => c.selected = (c.selected + n - 1) % n,
+            KeyCode::Esc => {
+                self.completion = None;
+                self.dismissed = self.token_at_cursor();
+            }
+            KeyCode::Tab => {
+                let pick = c.items[c.selected].insert.clone();
+                if let Some(token) = self.token_at_cursor() {
+                    self.body.checkpoint();
+                    self.body
+                        .replace_before_cursor(token.chars().count(), &format!("{pick} "));
+                }
+                self.completion = None;
+                self.asked = None;
+            }
+            _ => return false,
+        }
+        true
+    }
+
     /// A bracketed paste. Goes to the open prompt or the focused field
     /// in one go, so pasted newlines never submit anything and the
     /// one-line fields (prompt, CW) get them as spaces.
@@ -436,8 +611,14 @@ impl ComposeState {
         let one_line = || text.trim_end_matches('\n').replace('\n', " ");
         match (&mut self.prompt, self.focus) {
             (Some(Prompt::Path(t) | Prompt::Alt { text: t, .. }), _) => t.push_str(&one_line()),
-            (None, Focus::Spoiler) => self.spoiler.insert_str(&one_line()),
-            (None, Focus::Body) => self.body.insert_str(&text),
+            (None, Focus::Spoiler) => {
+                self.spoiler.checkpoint();
+                self.spoiler.insert_str(&one_line());
+            }
+            (None, Focus::Body) => {
+                self.body.checkpoint();
+                self.body.insert_str(&text);
+            }
         }
     }
 
@@ -449,6 +630,9 @@ impl ComposeState {
         self.notice = None;
         if self.prompt.is_some() {
             return self.handle_prompt_key(key);
+        }
+        if self.completion_visible() && self.handle_completion_key(key) {
+            return ComposeOutcome::Continue;
         }
 
         // Submit: Ctrl+Enter / Alt+Enter / Ctrl+D.
@@ -515,6 +699,11 @@ impl ComposeState {
         };
         let cw_height: u16 = if self.cw_enabled { 2 } else { 0 };
         let attach_height = (self.attachments.len() + usize::from(self.prompt.is_some())) as u16;
+        let suggest_height = if self.completion_visible() {
+            self.completion.as_ref().map_or(0, |c| c.items.len() as u16)
+        } else {
+            0
+        };
 
         let chunks = Layout::default()
             .direction(Direction::Vertical)
@@ -524,6 +713,7 @@ impl ComposeState {
                 Constraint::Length(preview_height), // reply / quote preview
                 Constraint::Length(cw_height),      // CW
                 Constraint::Min(3),                 // body
+                Constraint::Length(suggest_height), // @ / # suggestions
                 Constraint::Length(attach_height),  // attachments + prompt
                 Constraint::Length(2),              // footer
             ])
@@ -537,10 +727,13 @@ impl ComposeState {
             self.render_cw(frame, chunks[2], theme);
         }
         self.render_body(frame, chunks[3], theme);
-        if attach_height > 0 {
-            self.render_attachments(frame, chunks[4], theme, nerd_font);
+        if suggest_height > 0 {
+            self.render_suggestions(frame, chunks[4], theme);
         }
-        self.render_footer(frame, chunks[5], theme, nerd_font);
+        if attach_height > 0 {
+            self.render_attachments(frame, chunks[5], theme, nerd_font);
+        }
+        self.render_footer(frame, chunks[6], theme, nerd_font);
     }
 
     fn render_title(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
@@ -633,6 +826,36 @@ impl ComposeState {
         self.body.render(frame, area, style, focused);
     }
 
+    /// The suggestion list: the highlighted row carries the `▏` cursor
+    /// mark, like the selected post in a timeline.
+    fn render_suggestions(&self, frame: &mut Frame<'_>, area: Rect, theme: &Theme) {
+        let Some(c) = &self.completion else {
+            return;
+        };
+        let lines: Vec<Line<'static>> = c
+            .items
+            .iter()
+            .enumerate()
+            .map(|(i, item)| {
+                let (mark, style) = if i == c.selected {
+                    ("▏", theme.primary())
+                } else {
+                    (" ", theme.secondary())
+                };
+                Line::from(vec![
+                    Span::styled(mark, theme.cursor()),
+                    Span::styled(item.insert.clone(), style),
+                    Span::raw("  "),
+                    Span::styled(
+                        crate::util::emoji::normalize(&item.detail).into_owned(),
+                        theme.tertiary(),
+                    ),
+                ])
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), area);
+    }
+
     /// One row per attachment, then the open prompt (which owns the
     /// cursor while it exists).
     fn render_attachments(
@@ -713,6 +936,10 @@ impl ComposeState {
         ]);
         let line2 = match &self.notice {
             Some(msg) => Line::from(Span::styled(msg.clone(), theme.error_style())),
+            None if self.completion_visible() => Line::from(Span::styled(
+                "Tab complete · ↑↓ choose · Esc dismiss",
+                theme.tertiary(),
+            )),
             None => Line::from(Span::styled(
                 "Ctrl+Enter send · Esc cancel · Ctrl+V vis · Ctrl+S CW · Ctrl+O attach · Tab focus",
                 theme.tertiary(),
@@ -1018,6 +1245,111 @@ mod tests {
         press(&mut c, KeyCode::Char('o'), KeyModifiers::CONTROL);
         c.paste("/tmp/my\\ cat.png\n");
         assert!(matches!(&c.prompt, Some(Prompt::Path(p)) if p == "/tmp/my\\ cat.png"));
+    }
+
+    #[test]
+    fn untouched_prefill_is_not_a_change() {
+        let r = ReplyContext {
+            id: StatusId::new("1"),
+            author_acct: "alice@ex.com".into(),
+            excerpt: String::new(),
+        };
+        let mut c = ComposeState::reply(r, Visibility::Public, Limits::default());
+        assert!(
+            !c.has_changes(),
+            "the @mention prefill alone is nothing to lose"
+        );
+        press(&mut c, KeyCode::Char('x'), KeyModifiers::NONE);
+        assert!(c.has_changes());
+        press(&mut c, KeyCode::Backspace, KeyModifiers::NONE);
+        assert!(!c.has_changes());
+        // Deleting the prefill is a change too.
+        press(&mut c, KeyCode::Char('u'), KeyModifiers::CONTROL);
+        assert!(c.has_changes());
+    }
+
+    fn results(json: serde_json::Value) -> SearchResults {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn account_json(id: &str, acct: &str, name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "id": id, "username": acct.split('@').next().unwrap(), "acct": acct,
+            "display_name": name, "url": format!("https://ex.com/@{acct}"),
+            "note": "", "avatar": "", "avatar_static": "", "header": "",
+            "header_static": "", "locked": false, "bot": false,
+            "followers_count": 0, "following_count": 0, "statuses_count": 0,
+            "created_at": "2024-01-01T00:00:00.000Z", "emojis": [], "fields": []
+        })
+    }
+
+    #[test]
+    fn mention_token_is_looked_up_once_and_tab_completes_it() {
+        let mut c = ComposeState::blank(Limits::default());
+        type_text(&mut c, "hi @a");
+        assert_eq!(c.take_lookup(), None, "one char is too short to ask");
+        type_text(&mut c, "l");
+        assert_eq!(c.take_lookup().as_deref(), Some("@al"));
+        assert_eq!(c.take_lookup(), None, "already asked");
+
+        c.set_completions(
+            "@al",
+            &results(serde_json::json!({ "accounts": [
+                account_json("1", "alice", "Alice"),
+                account_json("2", "alan@other.social", "Alan"),
+            ]})),
+        );
+        assert!(c.completion_visible());
+        press(&mut c, KeyCode::Down, KeyModifiers::NONE);
+        press(&mut c, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(c.body.text(), "hi @alan@other.social ");
+        assert!(!c.completion_visible());
+        assert_eq!(c.take_lookup(), None, "nothing after the space");
+        // One undo puts the typed token back.
+        press(&mut c, KeyCode::Char('z'), KeyModifiers::CONTROL);
+        assert_eq!(c.body.text(), "hi @al");
+    }
+
+    #[test]
+    fn stale_or_dismissed_suggestions_stay_hidden() {
+        let tags = results(serde_json::json!({ "hashtags": [
+            { "name": "rust", "url": "https://ex.com/tags/rust",
+              "history": [{ "day": "1", "uses": "12", "accounts": "3" }] }
+        ]}));
+        let mut c = ComposeState::blank(Limits::default());
+        type_text(&mut c, "#ru");
+        assert_eq!(c.take_lookup().as_deref(), Some("#ru"));
+        type_text(&mut c, "s");
+        c.set_completions("#ru", &tags);
+        assert!(
+            !c.completion_visible(),
+            "answer for a token we've moved past"
+        );
+
+        assert_eq!(c.take_lookup().as_deref(), Some("#rus"));
+        c.set_completions("#rus", &tags);
+        assert!(c.completion_visible());
+        assert_eq!(
+            c.completion.as_ref().unwrap().items[0].detail,
+            "12 posts this week"
+        );
+
+        // Esc hides the list without cancelling the compose…
+        assert!(matches!(
+            press(&mut c, KeyCode::Esc, KeyModifiers::NONE),
+            ComposeOutcome::Continue
+        ));
+        assert!(!c.completion_visible());
+        // …and it stays away while the same tag keeps growing.
+        type_text(&mut c, "t");
+        assert_eq!(c.take_lookup(), None);
+        // A non-ASCII word is never mistaken for a token.
+        type_text(&mut c, " 你好");
+        assert_eq!(c.take_lookup(), None);
+        // Tab with no list still switches focus as before.
+        c.cw_enabled = true;
+        press(&mut c, KeyCode::Tab, KeyModifiers::NONE);
+        assert_eq!(c.focus, Focus::Spoiler);
     }
 
     #[test]

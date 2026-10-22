@@ -356,6 +356,7 @@ async fn handle_action(ctx: Ctx, action: Action) {
                 }
             }
         }
+        Action::Complete { query } => complete(&ctx, query).await,
         Action::SearchTag { name } => {
             let params = TimelineParams {
                 limit: Some(PAGE_SIZE),
@@ -1006,6 +1007,44 @@ async fn post_status(ctx: &Ctx, draft: &StatusDraft) -> bool {
             report_api_error(ctx, verb, &e).await;
             false
         }
+    }
+}
+
+/// How long a compose lookup waits for the user to stop typing.
+const COMPLETE_DEBOUNCE: Duration = Duration::from_millis(250);
+
+/// [`Action::Complete`]: wait out the debounce, then search accounts
+/// (`@…`) or hashtags (`#…`) without resolving remote ones.
+async fn complete(ctx: &Ctx, query: String) {
+    let generation = {
+        let mut st = lock(&ctx.state);
+        st.completion_generation += 1;
+        st.completion_generation
+    };
+    tokio::time::sleep(COMPLETE_DEBOUNCE).await;
+    if lock(&ctx.state).completion_generation != generation {
+        return;
+    }
+    let (kind, term) = if let Some(rest) = query.strip_prefix('@') {
+        ("accounts", rest)
+    } else if let Some(rest) = query.strip_prefix('#') {
+        ("hashtags", rest)
+    } else {
+        return;
+    };
+    let params = crate::api::endpoints::SearchParams {
+        q: term,
+        kind: Some(kind),
+        resolve: false,
+        following: false,
+        limit: Some(5),
+    };
+    match ctx.client.search(&params).await {
+        Ok(results) => {
+            send(&ctx.events, Event::Completions { query, results }).await;
+            note_api_ok(ctx).await;
+        }
+        Err(e) => debug!(?e, %query, "completion lookup failed"),
     }
 }
 
