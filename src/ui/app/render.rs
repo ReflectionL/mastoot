@@ -26,9 +26,10 @@ impl App {
             Mode::Compose(state) => {
                 state.render(frame, size, &self.theme, self.nerd_font);
             }
-            Mode::ComposeConfirmDiscard(state) => {
+            Mode::ComposeConfirmDiscard(state, quit) => {
+                let quit = *quit;
                 state.render(frame, size, &self.theme, self.nerd_font);
-                self.render_discard_confirm(frame, size);
+                self.render_discard_confirm(frame, size, quit);
             }
             Mode::DeleteConfirm(_) => {
                 let layout = Layout::default()
@@ -213,16 +214,23 @@ impl App {
         frame.render_widget(p, area);
     }
 
-    pub(super) fn render_discard_confirm(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+    pub(super) fn render_discard_confirm(
+        &self,
+        frame: &mut ratatui::Frame<'_>,
+        area: Rect,
+        quit: bool,
+    ) {
+        let question = if quit {
+            "  Quit and discard this draft?  (y / n)  "
+        } else {
+            "  Discard this draft?  (y / n)  "
+        };
         let lines = vec![
             Line::default(),
-            Line::from(Span::styled(
-                "  Discard this draft?  (y / n)  ",
-                self.theme.primary(),
-            )),
+            Line::from(Span::styled(question, self.theme.primary())),
             Line::default(),
         ];
-        let w = 40.min(area.width);
+        let w = (question.len() as u16 + 2).min(area.width);
         let h = 5.min(area.height);
         let rect = Rect {
             x: area.x + (area.width.saturating_sub(w)) / 2,
@@ -417,7 +425,7 @@ impl App {
             }
             Mode::AccountList(list) => list.kind.label().to_string(),
             Mode::AccountSwitcher(_) => "switch account".to_string(),
-            Mode::Compose(_) | Mode::ComposeConfirmDiscard(_) => "compose".to_string(),
+            Mode::Compose(_) | Mode::ComposeConfirmDiscard(..) => "compose".to_string(),
             Mode::DeleteConfirm(_) => "delete?".to_string(),
             Mode::QuitConfirm => "quit?".to_string(),
             Mode::Search(s) => format!("search \"{}\"", s.query),

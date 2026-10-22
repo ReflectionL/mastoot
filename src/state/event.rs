@@ -105,6 +105,13 @@ pub enum Action {
     Search {
         query: String,
     },
+    /// Compose autocomplete for the token at the cursor: `@ali` looks
+    /// up accounts, `#rus` hashtags. Debounced in the state task —
+    /// only the newest of a burst of keystrokes reaches the server.
+    /// Answered by [`Event::Completions`]; failures stay quiet.
+    Complete {
+        query: String,
+    },
     /// Hashtag timeline for `name` (without the `#`). Delivered as a
     /// [`Event::SearchStatuses`] so the search screen can show it.
     SearchTag {
@@ -231,6 +238,12 @@ pub enum Event {
     SearchStatuses {
         query: String,
         statuses: Vec<Status>,
+    },
+    /// Result of [`Action::Complete`]. `query` (sigil included) is
+    /// echoed so compose can drop answers for a token it has moved past.
+    Completions {
+        query: String,
+        results: SearchResults,
     },
     /// Either search request failed for `query`.
     SearchFailed {

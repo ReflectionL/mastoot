@@ -45,6 +45,9 @@ pub struct AppState {
     /// Newest notification id seen — the polling loop fetches
     /// `since_id` from here.
     pub notifications_newest: Option<NotificationId>,
+    /// Bumped by every [`crate::state::Action::Complete`]; a lookup
+    /// that wakes from its debounce to a newer number gives up.
+    pub completion_generation: u64,
 }
 
 /// Shared handle to the state, cloned into every action task.

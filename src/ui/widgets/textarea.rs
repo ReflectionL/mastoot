@@ -18,6 +18,7 @@
 //! | word left / right | `⌥←` / `⌥→` | `Alt+←/→`, `Alt+B/F` (ESC b / ESC f), `Ctrl+←/→` |
 //! | line start / end | `⌘←` / `⌘→` | `Super+←/→`, `Ctrl+A/E`, `Home` / `End` |
 //! | text start / end | `⌘↑` / `⌘↓` | `Super+↑/↓` |
+//! | undo / redo | `⌘Z` / `⇧⌘Z` | `Ctrl+Z` / `Ctrl+Y`, `Super+Z` / `Super+Shift+Z`, `Ctrl+_` |
 //!
 //! A "word" is a run of letters/digits or a run of CJK characters, so
 //! `⌥⌫` after `今天写Rust` takes `Rust` first, then `今天写`.
@@ -48,6 +49,33 @@ pub struct TextArea {
     /// How many rows were scrolled off the top during last render. We
     /// recompute this each frame from cursor-visibility rules.
     scroll: u16,
+    /// States to go back to (`Ctrl+Z`), oldest first, and the ones
+    /// undone since the last edit (redo).
+    undo: Vec<Snapshot>,
+    redo: Vec<Snapshot>,
+    /// What the last key did, for grouping consecutive typing into one
+    /// undo step.
+    last_edit: LastEdit,
+}
+
+/// Text and cursor, as one undo step restores them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Snapshot {
+    lines: Vec<String>,
+    row: usize,
+    col: usize,
+}
+
+/// How far back undo reaches.
+const UNDO_DEPTH: usize = 200;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LastEdit {
+    /// A move, an undo, a paste: the next edit starts a new step.
+    Other,
+    /// Typed a word char / whitespace. A run of typing is one step,
+    /// split where a word starts after whitespace, like macOS.
+    Typed { space: bool },
 }
 
 impl Default for TextArea {
@@ -64,6 +92,9 @@ impl TextArea {
             row: 0,
             col: 0,
             scroll: 0,
+            undo: Vec::new(),
+            redo: Vec::new(),
+            last_edit: LastEdit::Other,
         }
     }
 
@@ -195,6 +226,25 @@ impl TextArea {
         self.col = self.lines[self.row].chars().count();
     }
 
+    /// The cursor's line up to the cursor.
+    #[must_use]
+    pub fn text_before_cursor(&self) -> &str {
+        let line = &self.lines[self.row];
+        &line[..char_to_byte(line, self.col)]
+    }
+
+    /// Swap the `n` chars before the cursor for `with` (one line, no
+    /// newlines), leaving the cursor after it. Not an undo step of its
+    /// own — call [`Self::checkpoint`] first.
+    pub fn replace_before_cursor(&mut self, n: usize, with: &str) {
+        let start = self.col.saturating_sub(n);
+        self.remove_chars(start, self.col);
+        self.col = start;
+        for c in with.chars() {
+            self.insert_char(c);
+        }
+    }
+
     pub fn move_top(&mut self) {
         self.row = 0;
         self.col = 0;
@@ -277,9 +327,119 @@ impl TextArea {
         line.replace_range(range, "");
     }
 
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            lines: self.lines.clone(),
+            row: self.row,
+            col: self.col,
+        }
+    }
+
+    fn restore(&mut self, snap: Snapshot) {
+        self.lines = snap.lines;
+        self.row = snap.row;
+        self.col = snap.col;
+    }
+
+    fn push_undo(&mut self, snap: Snapshot) {
+        if self.undo.len() == UNDO_DEPTH {
+            self.undo.remove(0);
+        }
+        self.undo.push(snap);
+        self.redo.clear();
+    }
+
+    /// Start a new undo step before an edit made from outside
+    /// [`Self::handle_key`] (a paste, a completion).
+    pub fn checkpoint(&mut self) {
+        let snap = self.snapshot();
+        self.push_undo(snap);
+        self.last_edit = LastEdit::Other;
+    }
+
+    /// Step back one edit. Returns false when there is nothing to undo.
+    pub fn undo(&mut self) -> bool {
+        let Some(prev) = self.undo.pop() else {
+            return false;
+        };
+        self.redo.push(self.snapshot());
+        self.restore(prev);
+        self.last_edit = LastEdit::Other;
+        true
+    }
+
+    /// Re-apply the last undone edit.
+    pub fn redo(&mut self) -> bool {
+        let Some(next) = self.redo.pop() else {
+            return false;
+        };
+        self.undo.push(self.snapshot());
+        self.restore(next);
+        self.last_edit = LastEdit::Other;
+        true
+    }
+
     /// Feed a key event. Returns true if the key was consumed. See the
     /// module docs for which encodings map to which edit.
+    ///
+    /// Every edit is undoable: `Ctrl+Z` / `⌘Z` / `Ctrl+_` undo,
+    /// `Ctrl+Y` / `⇧⌘Z` / `Ctrl+Shift+Z` redo.
     pub fn handle_key(&mut self, key: KeyEvent) -> bool {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let sup = key
+            .modifiers
+            .intersects(KeyModifiers::SUPER | KeyModifiers::META);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        match key.code {
+            KeyCode::Char('z' | 'Z') if (ctrl || sup) && shift => {
+                self.redo();
+                return true;
+            }
+            KeyCode::Char('z') if ctrl || sup => {
+                self.undo();
+                return true;
+            }
+            // Ctrl+_ arrives as 0x1F, which crossterm reports as Ctrl+7.
+            KeyCode::Char('_' | '7') if ctrl => {
+                self.undo();
+                return true;
+            }
+            KeyCode::Char('y') if ctrl => {
+                self.redo();
+                return true;
+            }
+            _ => {}
+        }
+
+        let typed = match key.code {
+            KeyCode::Char(c) if key.modifiers.difference(KeyModifiers::SHIFT).is_empty() => {
+                Some(c.is_whitespace())
+            }
+            _ => None,
+        };
+        let before = self.snapshot();
+        let consumed = self.apply_key(key);
+        if self.lines == before.lines {
+            // A move (or an edit that changed nothing) ends a typing run.
+            if consumed {
+                self.last_edit = LastEdit::Other;
+            }
+            return consumed;
+        }
+        let continues_run = match (self.last_edit, typed) {
+            // Keep going unless a word starts right after whitespace.
+            (LastEdit::Typed { space }, Some(now_space)) => !space || now_space,
+            _ => false,
+        };
+        if !continues_run {
+            self.push_undo(before);
+        }
+        self.redo.clear();
+        self.last_edit = typed.map_or(LastEdit::Other, |space| LastEdit::Typed { space });
+        consumed
+    }
+
+    fn apply_key(&mut self, key: KeyEvent) -> bool {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         let sup = key
@@ -799,5 +959,87 @@ second line",
             &mut s,
             mods(KeyCode::Char('x'), KeyModifiers::CONTROL)
         ));
+    }
+
+    fn typed(ta: &mut TextArea, s: &str) {
+        for c in s.chars() {
+            ta.handle_key(key(KeyCode::Char(c)));
+        }
+    }
+
+    #[test]
+    fn undo_steps_back_by_word_runs_and_edits() {
+        let undo = mods(KeyCode::Char('z'), KeyModifiers::CONTROL);
+        let redo = mods(KeyCode::Char('y'), KeyModifiers::CONTROL);
+        let mut ta = TextArea::new();
+        typed(&mut ta, "hello big world");
+        ta.handle_key(mods(KeyCode::Backspace, KeyModifiers::ALT));
+        assert_eq!(ta.text(), "hello big ");
+
+        ta.handle_key(undo);
+        assert_eq!(ta.text(), "hello big world");
+        assert_eq!(ta.col, 15, "cursor comes back too");
+        ta.handle_key(undo);
+        assert_eq!(ta.text(), "hello big ");
+        ta.handle_key(undo);
+        assert_eq!(ta.text(), "hello ");
+        ta.handle_key(redo);
+        assert_eq!(ta.text(), "hello big ");
+        // A fresh edit drops the redo branch.
+        typed(&mut ta, "x");
+        assert!(!ta.redo());
+        ta.handle_key(undo);
+        ta.handle_key(undo);
+        ta.handle_key(undo);
+        assert_eq!(ta.text(), "");
+        assert!(!ta.undo(), "nothing left");
+    }
+
+    #[test]
+    fn undo_accepts_mac_and_readline_spellings() {
+        for (u, r) in [
+            (
+                mods(KeyCode::Char('z'), KeyModifiers::SUPER),
+                mods(
+                    KeyCode::Char('z'),
+                    KeyModifiers::SUPER | KeyModifiers::SHIFT,
+                ),
+            ),
+            (
+                mods(KeyCode::Char('7'), KeyModifiers::CONTROL), // Ctrl+_ (0x1F)
+                mods(
+                    KeyCode::Char('Z'),
+                    KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+                ),
+            ),
+        ] {
+            let mut ta = TextArea::new();
+            typed(&mut ta, "abc");
+            assert!(ta.handle_key(u));
+            assert_eq!(ta.text(), "", "{u:?}");
+            assert!(ta.handle_key(r));
+            assert_eq!(ta.text(), "abc", "{r:?}");
+        }
+    }
+
+    #[test]
+    fn moving_the_cursor_splits_the_typing_run() {
+        let mut ta = TextArea::new();
+        typed(&mut ta, "ab");
+        ta.handle_key(key(KeyCode::Left));
+        typed(&mut ta, "X");
+        assert_eq!(ta.text(), "aXb");
+        ta.undo();
+        assert_eq!(ta.text(), "ab");
+    }
+
+    #[test]
+    fn checkpoint_makes_an_outside_edit_undoable() {
+        let mut ta = TextArea::from_text("keep");
+        assert!(!ta.undo(), "the prefill is the starting point");
+        ta.checkpoint();
+        ta.insert_str(" pasted\ntext");
+        ta.undo();
+        assert_eq!(ta.text(), "keep");
     }
 }

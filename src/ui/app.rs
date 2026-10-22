@@ -229,7 +229,10 @@ enum Mode {
     Timeline,
     Compose(ComposeState),
     /// "Discard this draft?" confirm when user hits Esc with non-empty body.
-    ComposeConfirmDiscard(ComposeState),
+    /// "Discard this draft?" over a compose with changes. The flag is
+    /// what a yes leads to: `true` quits the app (Ctrl+C), `false`
+    /// returns to wherever compose was opened from (Esc).
+    ComposeConfirmDiscard(ComposeState, bool),
     /// Reading the focal post + its reply chain.
     StatusDetail(DetailState),
     /// Profile page — covers tab 5 (self) and modal `u` view (others).
