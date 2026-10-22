@@ -636,11 +636,22 @@ impl Instance {
     /// the field — caller should fall back to its own default.
     #[must_use]
     pub fn max_characters(&self) -> Option<u32> {
+        self.statuses_limit("max_characters")
+    }
+
+    /// `configuration.statuses.max_media_attachments`: how many files
+    /// one post may carry. `None` if the server omits it.
+    #[must_use]
+    pub fn max_media_attachments(&self) -> Option<u32> {
+        self.statuses_limit("max_media_attachments")
+    }
+
+    fn statuses_limit(&self, key: &str) -> Option<u32> {
         let n = self
             .configuration
             .as_ref()?
             .get("statuses")?
-            .get("max_characters")?
+            .get(key)?
             .as_u64()?;
         u32::try_from(n).ok()
     }
@@ -671,5 +682,33 @@ mod opt_datetime {
                 .map(|dt| Some(dt.with_timezone(&Utc)))
                 .map_err(D::Error::custom),
         }
+    }
+}
+
+#[cfg(test)]
+mod instance_tests {
+    use super::Instance;
+
+    #[test]
+    fn statuses_limits_come_out_of_configuration() {
+        let inst: Instance = serde_json::from_value(serde_json::json!({
+            "domain": "example.social",
+            "title": "Example",
+            "version": "4.5.0",
+            "configuration": {
+                "statuses": { "max_characters": 1000, "max_media_attachments": 8 }
+            }
+        }))
+        .unwrap();
+        assert_eq!(inst.max_characters(), Some(1000));
+        assert_eq!(inst.max_media_attachments(), Some(8));
+
+        let bare: Instance = serde_json::from_value(serde_json::json!({
+            "domain": "example.social",
+            "title": "Example",
+            "version": "4.5.0"
+        }))
+        .unwrap();
+        assert_eq!(bare.max_media_attachments(), None);
     }
 }

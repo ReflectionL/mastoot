@@ -8,8 +8,24 @@ use super::{
     SearchOutcome, SearchScreen, Status, StatusId, SwitcherOutcome, TimelineKind, ToastLevel,
     api_to_state_vis, config, quote_context_from, reply_context_from, state,
 };
+use crate::ui::widgets::textarea::edit_prompt;
 
 impl App {
+    /// Handle a bracketed paste. Only text fields take it; anywhere
+    /// else it is dropped, so a stray paste can't act on a post.
+    pub(super) fn handle_paste(&mut self, text: &str) {
+        if self.show_help {
+            return;
+        }
+        match &mut self.mode {
+            Mode::Compose(state) => state.paste(text),
+            Mode::SearchPrompt(query) => {
+                query.push_str(text.trim().replace(['\r', '\n'], " ").as_str());
+            }
+            _ => {}
+        }
+    }
+
     /// Handle a key press. Returns `false` when the app should quit.
     pub(super) async fn handle_key(
         &mut self,
@@ -28,9 +44,26 @@ impl App {
             return true;
         }
 
-        // Any key dismisses the help overlay.
+        // j/k and friends scroll the help overlay; any other key closes
+        // it. Render clamps the offset, so overshooting is harmless.
         if self.show_help {
-            self.show_help = false;
+            const PAGE: u16 = 10;
+            let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => self.help_scroll += 1,
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.help_scroll = self.help_scroll.saturating_sub(1);
+                }
+                KeyCode::Char('d') if ctrl => self.help_scroll += PAGE,
+                KeyCode::Char(' ') | KeyCode::PageDown => self.help_scroll += PAGE,
+                KeyCode::Char('u') if ctrl => {
+                    self.help_scroll = self.help_scroll.saturating_sub(PAGE);
+                }
+                KeyCode::PageUp => self.help_scroll = self.help_scroll.saturating_sub(PAGE),
+                KeyCode::Char('g') | KeyCode::Home => self.help_scroll = 0,
+                KeyCode::Char('G') | KeyCode::End => self.help_scroll = u16::MAX,
+                _ => self.show_help = false,
+            }
             return true;
         }
 
@@ -118,18 +151,10 @@ impl App {
                             let _ = tx.send(Action::Search { query: q }).await;
                         }
                     }
-                    KeyCode::Backspace => {
-                        query.pop();
+                    _ => {
+                        edit_prompt(&mut query, key);
                         self.mode = Mode::SearchPrompt(query);
                     }
-                    KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        self.mode = Mode::SearchPrompt(String::new());
-                    }
-                    KeyCode::Char(c) if !key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        query.push(c);
-                        self.mode = Mode::SearchPrompt(query);
-                    }
-                    _ => self.mode = Mode::SearchPrompt(query),
                 }
                 return true;
             }
@@ -413,6 +438,7 @@ impl App {
             }
             KeyCode::Char('?') => {
                 self.show_help = true;
+                self.help_scroll = 0;
             }
             KeyCode::Char('1') => self.switch_to(TimelineKind::Home, tx).await,
             KeyCode::Char('2') => self.switch_to(TimelineKind::Local, tx).await,
@@ -497,23 +523,19 @@ impl App {
         let in_profile = matches!(self.mode, Mode::Profile(_));
         match key.code {
             KeyCode::Char('c') => {
-                self.push_mode(Mode::Compose(ComposeState::blank(self.max_chars)));
+                self.push_mode(Mode::Compose(ComposeState::blank(self.limits)));
             }
             KeyCode::Char('r') => {
                 if let Some(target) = self.current_target().cloned() {
                     let reply = reply_context_from(&target, 80);
                     let vis = api_to_state_vis(target.visibility);
-                    self.push_mode(Mode::Compose(ComposeState::reply(
-                        reply,
-                        vis,
-                        self.max_chars,
-                    )));
+                    self.push_mode(Mode::Compose(ComposeState::reply(reply, vis, self.limits)));
                 }
             }
             KeyCode::Char('q') => {
                 if let Some(target) = self.current_target().cloned() {
                     let quote = quote_context_from(&target, 80);
-                    self.push_mode(Mode::Compose(ComposeState::quote(quote, self.max_chars)));
+                    self.push_mode(Mode::Compose(ComposeState::quote(quote, self.limits)));
                 }
             }
             KeyCode::Char('d') => {

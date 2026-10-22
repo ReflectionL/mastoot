@@ -85,11 +85,23 @@ pub const SECTIONS: &[Section] = &[
         bindings: &[
             b("Ctrl+Enter", "send (Alt+Enter and Ctrl+D also work)"),
             b("Esc", "cancel (asks first if there is a draft)"),
-            b("Ctrl+W", "cycle visibility"),
+            b("Ctrl+V", "cycle visibility"),
             b("Ctrl+S", "toggle content warning"),
-            b("Ctrl+A", "attach a file (path, then optional alt text)"),
+            b("Ctrl+O", "attach a file (path, then optional alt text)"),
             b("Ctrl+X", "remove the last attachment"),
             b("Tab", "switch between body and content warning"),
+        ],
+    },
+    Section {
+        title: "Editing text (compose, search, prompts)",
+        bindings: &[
+            b("⌥⌫ / Ctrl+W", "delete the word before the cursor"),
+            b("⌘⌫ / Ctrl+U", "delete to the start of the line"),
+            b("⌥⌦ / Alt+D", "delete the word after the cursor"),
+            b("⌘⌦ / Ctrl+K", "delete to the end of the line"),
+            b("⌥← / ⌥→", "move by word (also Alt+B / Alt+F, Ctrl+← / →)"),
+            b("⌘← / ⌘→", "start / end of line (also Ctrl+A / Ctrl+E)"),
+            b("⌘↑ / ⌘↓", "start / end of the text"),
         ],
     },
 ];
@@ -99,7 +111,8 @@ pub const README_START: &str = "<!-- keys:start (generated from src/ui/keymap.rs
 /// Closing fence; see [`README_START`].
 pub const README_END: &str = "<!-- keys:end -->";
 
-/// Lines for the help overlay, section titles included.
+/// Lines for the help overlay, section titles included. The closing
+/// hint is left to the overlay, which knows whether it has to scroll.
 #[must_use]
 pub fn help_lines() -> Vec<String> {
     let key_col = SECTIONS
@@ -117,7 +130,6 @@ pub fn help_lines() -> Vec<String> {
         }
         out.push(String::new());
     }
-    out.push("  (press any key to dismiss)".to_string());
     out
 }
 

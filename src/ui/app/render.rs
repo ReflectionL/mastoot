@@ -485,19 +485,30 @@ impl App {
         frame.render_widget(Paragraph::new(lines), rect);
     }
 
-    pub(super) fn render_help_overlay(&self, frame: &mut ratatui::Frame<'_>, area: Rect) {
-        let help_lines = crate::ui::keymap::help_lines();
+    pub(super) fn render_help_overlay(&mut self, frame: &mut ratatui::Frame<'_>, area: Rect) {
+        let mut help_lines = crate::ui::keymap::help_lines();
+        let width_of = |l: &String| {
+            l.chars()
+                .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
+                .sum::<usize>()
+        };
+        // The list plus its closing hint, inside the borders.
+        let inner_h = area.height.saturating_sub(2);
+        let overflows = help_lines.len() + 1 > usize::from(inner_h);
+        help_lines.push(
+            if overflows {
+                "  (j/k scroll · any other key closes)"
+            } else {
+                "  (press any key to dismiss)"
+            }
+            .to_string(),
+        );
+        let max_scroll = (help_lines.len() as u16).saturating_sub(inner_h);
+        self.help_scroll = self.help_scroll.min(max_scroll);
+
         // Fit the box to the longest line (+ borders + a little air)
         // instead of a fixed width, so no entry gets clipped.
-        let longest = help_lines
-            .iter()
-            .map(|l| {
-                l.chars()
-                    .map(|c| unicode_width::UnicodeWidthChar::width(c).unwrap_or(1))
-                    .sum::<usize>()
-            })
-            .max()
-            .unwrap_or(0) as u16;
+        let longest = help_lines.iter().map(width_of).max().unwrap_or(0) as u16;
         let w = (longest + 4).min(area.width);
         let h = (help_lines.len() as u16 + 2).min(area.height);
         let rect = Rect {
@@ -511,12 +522,80 @@ impl App {
             .map(|s| Line::from(Span::styled(s, self.theme.primary())))
             .collect();
         frame.render_widget(ratatui::widgets::Clear, rect);
-        let block = ratatui::widgets::Block::new()
+        let mut block = ratatui::widgets::Block::new()
             .borders(ratatui::widgets::Borders::ALL)
             .border_style(self.theme.tertiary());
+        // Which way there is more, quietly, in the bottom border.
+        let more = match (self.help_scroll > 0, self.help_scroll < max_scroll) {
+            (false, true) => " ↓ ",
+            (true, true) => " ↑↓ ",
+            (true, false) => " ↑ ",
+            (false, false) => "",
+        };
+        if !more.is_empty() {
+            block = block.title_bottom(Line::from(more).right_aligned());
+        }
         let p = Paragraph::new(lines)
             .style(self.theme.primary())
-            .block(block);
+            .block(block)
+            .scroll((self.help_scroll, 0));
         frame.render_widget(p, rect);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Config, MediaRender};
+    use crate::ui::Theme;
+    use ratatui::Terminal;
+    use ratatui::backend::TestBackend;
+
+    fn app() -> App {
+        let mut cfg = Config::default();
+        cfg.ui.media_render = MediaRender::TextOnly;
+        App::new(Theme::by_name("frost"), StreamMode::Off, cfg)
+    }
+
+    fn help_grid(app: &mut App, w: u16, h: u16) -> String {
+        let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
+        term.draw(|f| app.render_help_overlay(f, f.area())).unwrap();
+        let buf = term.backend().buffer();
+        (0..h)
+            .map(|y| (0..w).map(|x| buf[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn help_overlay_scrolls_when_the_terminal_is_short() {
+        let mut app = app();
+        app.show_help = true;
+        let top = help_grid(&mut app, 100, 20);
+        assert!(top.contains("mastoot — keys"), "{top}");
+        assert!(!top.contains("j/k scroll"), "the hint sits at the very end");
+        assert!(top.contains('↓'), "{top}");
+
+        // Overshooting clamps to the last page, which ends on the hint.
+        app.help_scroll = u16::MAX;
+        let bottom = help_grid(&mut app, 100, 20);
+        assert!(
+            bottom.contains("j/k scroll · any other key closes"),
+            "{bottom}"
+        );
+        assert!(!bottom.contains("mastoot — keys"), "{bottom}");
+        let max = app.help_scroll;
+        assert!(max > 0 && max < u16::MAX);
+    }
+
+    #[test]
+    fn help_overlay_fits_without_scrolling_on_a_tall_terminal() {
+        let mut app = app();
+        app.show_help = true;
+        app.help_scroll = 5;
+        let grid = help_grid(&mut app, 100, 120);
+        assert_eq!(app.help_scroll, 0, "nothing to scroll");
+        assert!(grid.contains("press any key to dismiss"), "{grid}");
+        assert!(grid.contains("mastoot — keys"), "{grid}");
     }
 }

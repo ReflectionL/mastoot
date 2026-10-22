@@ -348,10 +348,20 @@ Theme {
 |-----|--------|
 | `Ctrl+Enter` | 发送 |
 | `Esc` | 取消（有确认弹窗） |
-| `Ctrl+W` | 设置可见性 |
+| `Ctrl+V` | 设置可见性 |
 | `Ctrl+S` | 切换敏感内容标记 |
-| `Ctrl+A` | 附加文件（路径 → alt text） |
+| `Ctrl+O` | 附加文件（路径 → alt text） |
 | `Ctrl+X` | 移除最后一个附件 |
+
+**文本编辑**（compose / 搜索 / 附件 prompt 通用，`widgets/textarea.rs`）：
+macOS 键 + readline 兜底，同一动作接受所有常见终端编码。
+| Key | Action |
+|-----|--------|
+| `⌥⌫` / `Alt+Backspace` / `Ctrl+W` | 删前一个词 |
+| `⌘⌫` / `Super+Backspace` / `Ctrl+U` | 删到行首 |
+| `⌥⌦` / `Alt+D` · `⌘⌦` / `Ctrl+K` | 删后一个词 · 删到行尾 |
+| `⌥←/→` / `Alt+B/F` / `Ctrl+←/→` | 按词移动 |
+| `⌘←/→` / `Ctrl+A/E` · `⌘↑/↓` | 行首/尾 · 全文首/尾 |
 
 ## 8. 代码规范
 
@@ -453,6 +463,7 @@ cargo run --example fetch_home
 
 ### Phase 5  多账号 + quote 完整链路  ·  2026-04-18
 
+- 文本编辑 · 2026-10-22 — textarea 支持 macOS 删除/移动键（`⌥⌫` 删词、`⌘⌫` 删到行首、`⌥←/→` 按词跳等），兼容 ESC DEL / `Ctrl+W` / `Ctrl+U` / kitty `Super` 各种编码；词 = 字母数字串或 CJK 串；搜索和附件 prompt 共用 `edit_prompt`。为避让 readline 键，compose 可见性 `Ctrl+W`→`Ctrl+V`、附件 `Ctrl+A`→`Ctrl+O`。顺带：帮助浮层矮终端可 `j/k` 滚动；附件上限读实例 `max_media_attachments`（`compose::Limits`）；开 bracketed paste（timeline 里误粘贴不再触发 `f`/`b`/`d`，粘贴进 compose 一次插入）
 - 自动发版 · 2026-10-13 — main 上 `Cargo.toml` 版本号变化 → `auto-tag.yml` 建 `vX.Y.Z` tag 并 dispatch `release.yml`（手加 `workflow_dispatch`，`allow-dirty = ["ci"]`）
 - 自更新 · 2026-10-13 — `mastoot update [--check]`（`commands/update.rs`，内嵌 axoupdater，读 cargo-dist 安装回执）；无回执时提示 brew / 源码升级办法；README 加 Install 一节
 - 发帖带附件 · 2026-10-13 — compose `Ctrl+A` 附件（路径 → alt text）/ `Ctrl+X` 删除；`Action::UploadMedia` / `Event::MediaUploaded`；`upload_media_ready` 轮询服务端处理；最多 4 个，编辑模式禁用

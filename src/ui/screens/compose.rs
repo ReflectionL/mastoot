@@ -19,19 +19,22 @@
 //! █
 //!
 //! visibility: public          Ctrl+Enter send · Esc cancel
-//!                             Ctrl+W visibility · Ctrl+S CW
+//!                             Ctrl+V visibility · Ctrl+S CW
 //! ```
 //!
 //! Keys handled:
 //! - `Ctrl+Enter`, `Alt+Enter`, `Ctrl+D` → submit
 //! - `Esc` → cancel (the app layer decides whether to show a confirm)
-//! - `Ctrl+W` → cycle visibility
+//! - `Ctrl+V` → cycle visibility
 //! - `Ctrl+S` → toggle CW field (and focus it on toggle-on)
-//! - `Ctrl+A` → attach a file: a one-line path prompt, then an
+//! - `Ctrl+O` → attach a file: a one-line path prompt, then an
 //!   optional alt-text prompt (`Enter` skips); `Ctrl+X` drops the last
 //!   attachment
 //! - `Tab` / `Shift+Tab` → switch focus body ↔ spoiler
-//! - everything else routed to the focused text area
+//! - everything else routed to the focused text area, which owns the
+//!   macOS / readline editing keys (`⌥⌫`, `⌘⌫`, `Ctrl+W`, `Ctrl+U`,
+//!   `Ctrl+A`, …) — which is why visibility and attach don't sit on
+//!   `Ctrl+W` / `Ctrl+A`
 
 use std::path::{Path, PathBuf};
 
@@ -48,7 +51,7 @@ use crate::api::models::{MediaId, StatusId, StatusSource};
 use crate::icons;
 use crate::state::Visibility;
 use crate::ui::Theme;
-use crate::ui::widgets::textarea::TextArea;
+use crate::ui::widgets::textarea::{TextArea, edit_prompt};
 
 /// Default Mastodon character limit. Phase 3.5 will fetch the real
 /// number from `/api/v2/instance`.
@@ -72,7 +75,25 @@ pub struct QuoteContext {
 }
 
 /// Most attachments one post can carry (Mastodon's default cap).
-pub const MAX_ATTACHMENTS: usize = 4;
+pub const DEFAULT_MAX_ATTACHMENTS: usize = 4;
+
+/// What the instance lets one post carry. Both come from
+/// `/api/v2/instance.configuration.statuses`; the defaults stand in
+/// until that has loaded (or if the server leaves them out).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Limits {
+    pub max_chars: usize,
+    pub max_attachments: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_chars: DEFAULT_MAX_CHARS,
+            max_attachments: DEFAULT_MAX_ATTACHMENTS,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AttachState {
@@ -91,7 +112,7 @@ struct Attachment {
     state: AttachState,
 }
 
-/// The one-line prompt `Ctrl+A` opens at the bottom of the screen.
+/// The one-line prompt `Ctrl+O` opens at the bottom of the screen.
 #[derive(Debug, Clone)]
 enum Prompt {
     Path(String),
@@ -126,13 +147,13 @@ pub struct ComposeState {
     /// Editing an existing post rather than writing a new one.
     edit_of: Option<StatusId>,
     focus: Focus,
-    max_chars: usize,
+    limits: Limits,
     attachments: Vec<Attachment>,
     next_local_id: u64,
     prompt: Option<Prompt>,
-    /// One-shot message for the footer ("4 attachments max"); cleared
+    /// One-shot message for the footer ("attachment limit reached (4)"); cleared
     /// by the next key.
-    notice: Option<&'static str>,
+    notice: Option<String>,
 }
 
 /// Return value of [`ComposeState::handle_key`].
@@ -164,36 +185,29 @@ pub struct ComposeDraft {
 }
 
 impl ComposeState {
-    /// Fresh top-level post. `max_chars` should come from
-    /// `/api/v2/instance.configuration.statuses.max_characters`; pass
-    /// [`DEFAULT_MAX_CHARS`] only if the instance hasn't replied yet.
+    /// Fresh top-level post. `limits` should come from the instance;
+    /// [`Limits::default`] only if it hasn't replied yet.
     #[must_use]
-    pub fn blank(max_chars: usize) -> Self {
-        Self::with(None, None, None, Visibility::Public, max_chars)
+    pub fn blank(limits: Limits) -> Self {
+        Self::with(None, None, None, Visibility::Public, limits)
     }
 
     /// Reply to `reply.id`. Body is pre-filled with `@author ` so the
     /// mention is first-class. Visibility copies the parent's — required
     /// by Mastodon for DM replies to stay DMs.
     #[must_use]
-    pub fn reply(reply: ReplyContext, parent_visibility: Visibility, max_chars: usize) -> Self {
+    pub fn reply(reply: ReplyContext, parent_visibility: Visibility, limits: Limits) -> Self {
         let prefix = format!("@{} ", reply.author_acct);
-        Self::with(
-            Some(reply),
-            None,
-            Some(prefix),
-            parent_visibility,
-            max_chars,
-        )
+        Self::with(Some(reply), None, Some(prefix), parent_visibility, limits)
     }
 
     /// Quote `quote.id` (Mastodon 4.5 native quote). Body starts
     /// empty — quote posts typically don't auto-@-mention the
     /// original author; the quote card is the reference. Visibility
-    /// defaults to `Public` (user can cycle with Ctrl+W).
+    /// defaults to `Public` (user can cycle with Ctrl+V).
     #[must_use]
-    pub fn quote(quote: QuoteContext, max_chars: usize) -> Self {
-        Self::with(None, Some(quote), None, Visibility::Public, max_chars)
+    pub fn quote(quote: QuoteContext, limits: Limits) -> Self {
+        Self::with(None, Some(quote), None, Visibility::Public, limits)
     }
 
     /// Edit one of the user's own posts. Body and CW are the author's
@@ -201,8 +215,8 @@ impl ComposeState {
     /// be changed by an edit on Mastodon, so the footer shows the
     /// post's current one.
     #[must_use]
-    pub fn edit(source: StatusSource, visibility: Visibility, max_chars: usize) -> Self {
-        let mut me = Self::with(None, None, Some(source.text), visibility, max_chars);
+    pub fn edit(source: StatusSource, visibility: Visibility, limits: Limits) -> Self {
+        let mut me = Self::with(None, None, Some(source.text), visibility, limits);
         if !source.spoiler_text.trim().is_empty() {
             me.cw_enabled = true;
             me.spoiler = TextArea::from_text(source.spoiler_text.trim());
@@ -216,7 +230,7 @@ impl ComposeState {
         quote: Option<QuoteContext>,
         prefill: Option<String>,
         vis: Visibility,
-        max_chars: usize,
+        limits: Limits,
     ) -> Self {
         let mut body = prefill.map(|s| TextArea::from_text(&s)).unwrap_or_default();
         // Park the cursor at end-of-prefill so typing starts after it.
@@ -230,7 +244,7 @@ impl ComposeState {
             quote,
             edit_of: None,
             focus: Focus::Body,
-            max_chars,
+            limits,
             attachments: Vec::new(),
             next_local_id: 0,
             prompt: None,
@@ -252,7 +266,7 @@ impl ComposeState {
     }
 
     fn over_limit(&self) -> bool {
-        self.char_count() > self.max_chars
+        self.char_count() > self.limits.max_chars
     }
 
     fn submit(&self) -> Option<ComposeDraft> {
@@ -315,7 +329,6 @@ impl ComposeState {
 
     /// Keys while the attach prompt is open: it swallows everything.
     fn handle_prompt_key(&mut self, key: KeyEvent) -> ComposeOutcome {
-        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let Some(prompt) = self.prompt.take() else {
             return ComposeOutcome::Continue;
         };
@@ -328,10 +341,10 @@ impl ComposeState {
                 let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
                 let path = expand_path(&raw, home.as_deref());
                 if !path.is_file() {
-                    self.notice = Some("no such file");
+                    self.notice = Some("no such file".into());
                     self.prompt = Some(Prompt::Path(raw));
                 } else if mime_for_path(&path).is_none() {
-                    self.notice = Some("unsupported file type");
+                    self.notice = Some("unsupported file type".into());
                     self.prompt = Some(Prompt::Path(raw));
                 } else {
                     self.prompt = Some(Prompt::Alt {
@@ -362,14 +375,7 @@ impl ComposeState {
                 let text = match &mut prompt {
                     Prompt::Path(t) | Prompt::Alt { text: t, .. } => t,
                 };
-                match code {
-                    KeyCode::Backspace => {
-                        text.pop();
-                    }
-                    KeyCode::Char('u') if ctrl => text.clear(),
-                    KeyCode::Char(c) if !ctrl => text.push(c),
-                    _ => {}
-                }
+                edit_prompt(text, KeyEvent::new(code, key.modifiers));
                 self.prompt = Some(prompt);
             }
         }
@@ -378,9 +384,12 @@ impl ComposeState {
 
     fn open_attach_prompt(&mut self) {
         if self.edit_of.is_some() {
-            self.notice = Some("can't change attachments while editing");
-        } else if self.attachments.len() >= MAX_ATTACHMENTS {
-            self.notice = Some("4 attachments max");
+            self.notice = Some("can't change attachments while editing".into());
+        } else if self.attachments.len() >= self.limits.max_attachments {
+            self.notice = Some(format!(
+                "attachment limit reached ({})",
+                self.limits.max_attachments
+            ));
         } else {
             self.prompt = Some(Prompt::Path(String::new()));
         }
@@ -418,6 +427,20 @@ impl ComposeState {
         };
     }
 
+    /// A bracketed paste. Goes to the open prompt or the focused field
+    /// in one go, so pasted newlines never submit anything and the
+    /// one-line fields (prompt, CW) get them as spaces.
+    pub fn paste(&mut self, text: &str) {
+        self.notice = None;
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
+        let one_line = || text.trim_end_matches('\n').replace('\n', " ");
+        match (&mut self.prompt, self.focus) {
+            (Some(Prompt::Path(t) | Prompt::Alt { text: t, .. }), _) => t.push_str(&one_line()),
+            (None, Focus::Spoiler) => self.spoiler.insert_str(&one_line()),
+            (None, Focus::Body) => self.body.insert_str(&text),
+        }
+    }
+
     /// Keyboard driver. See file-level docs for the bindings table.
     pub fn handle_key(&mut self, key: KeyEvent) -> ComposeOutcome {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
@@ -446,7 +469,7 @@ impl ComposeState {
             return ComposeOutcome::Cancel;
         }
         // Modal toggles.
-        if ctrl && matches!(key.code, KeyCode::Char('w')) {
+        if ctrl && matches!(key.code, KeyCode::Char('v')) {
             self.cycle_visibility();
             return ComposeOutcome::Continue;
         }
@@ -454,7 +477,7 @@ impl ComposeState {
             self.toggle_cw();
             return ComposeOutcome::Continue;
         }
-        if ctrl && matches!(key.code, KeyCode::Char('a')) {
+        if ctrl && matches!(key.code, KeyCode::Char('o')) {
             self.open_attach_prompt();
             return ComposeOutcome::Continue;
         }
@@ -532,12 +555,12 @@ impl ComposeState {
         };
         let count_style = if self.over_limit() {
             theme.error_style()
-        } else if self.char_count() * 10 > self.max_chars * 9 {
+        } else if self.char_count() * 10 > self.limits.max_chars * 9 {
             theme.favorite_style()
         } else {
             theme.tertiary()
         };
-        let count_text = format!("{} / {}", self.char_count(), self.max_chars);
+        let count_text = format!("{} / {}", self.char_count(), self.limits.max_chars);
         // Build a line: title on left, counter on right. Padding with
         // spaces is cheaper than a 2-column layout for a single line.
         let pad = area
@@ -688,10 +711,10 @@ impl ComposeState {
                 theme.secondary().add_modifier(Modifier::BOLD),
             ),
         ]);
-        let line2 = match self.notice {
-            Some(msg) => Line::from(Span::styled(msg, theme.error_style())),
+        let line2 = match &self.notice {
+            Some(msg) => Line::from(Span::styled(msg.clone(), theme.error_style())),
             None => Line::from(Span::styled(
-                "Ctrl+Enter send · Esc cancel · Ctrl+W vis · Ctrl+S CW · Ctrl+A attach · Tab focus",
+                "Ctrl+Enter send · Esc cancel · Ctrl+V vis · Ctrl+S CW · Ctrl+O attach · Tab focus",
                 theme.tertiary(),
             )),
         };
@@ -768,7 +791,7 @@ mod tests {
 
     #[test]
     fn blank_starts_empty() {
-        let c = ComposeState::blank(DEFAULT_MAX_CHARS);
+        let c = ComposeState::blank(Limits::default());
         assert!(c.is_body_empty());
         assert_eq!(c.char_count(), 0);
     }
@@ -780,16 +803,16 @@ mod tests {
             author_acct: "alice@ex.com".into(),
             excerpt: "hi".into(),
         };
-        let c = ComposeState::reply(r, Visibility::Public, DEFAULT_MAX_CHARS);
+        let c = ComposeState::reply(r, Visibility::Public, Limits::default());
         assert_eq!(c.body.text(), "@alice@ex.com ");
     }
 
     #[test]
-    fn ctrl_w_cycles_visibility() {
-        let mut c = ComposeState::blank(DEFAULT_MAX_CHARS);
+    fn ctrl_v_cycles_visibility() {
+        let mut c = ComposeState::blank(Limits::default());
         let start = c.visibility;
         c.handle_key(KeyEvent {
-            code: KeyCode::Char('w'),
+            code: KeyCode::Char('v'),
             modifiers: KeyModifiers::CONTROL,
             kind: crossterm::event::KeyEventKind::Press,
             state: crossterm::event::KeyEventState::NONE,
@@ -799,7 +822,7 @@ mod tests {
 
     #[test]
     fn ctrl_enter_submits_when_non_empty() {
-        let mut c = ComposeState::blank(DEFAULT_MAX_CHARS);
+        let mut c = ComposeState::blank(Limits::default());
         c.body = TextArea::from_text("hello");
         let out = c.handle_key(KeyEvent {
             code: KeyCode::Enter,
@@ -815,7 +838,7 @@ mod tests {
 
     #[test]
     fn ctrl_enter_noops_when_empty() {
-        let mut c = ComposeState::blank(DEFAULT_MAX_CHARS);
+        let mut c = ComposeState::blank(Limits::default());
         let out = c.handle_key(KeyEvent {
             code: KeyCode::Enter,
             modifiers: KeyModifiers::CONTROL,
@@ -832,7 +855,7 @@ mod tests {
             author_acct: "bob@ex.com".into(),
             excerpt: "original body".into(),
         };
-        let mut c = ComposeState::quote(q, DEFAULT_MAX_CHARS);
+        let mut c = ComposeState::quote(q, Limits::default());
         assert!(
             c.is_body_empty(),
             "quote compose should start with an empty body"
@@ -856,7 +879,7 @@ mod tests {
 
     #[test]
     fn esc_cancels() {
-        let mut c = ComposeState::blank(DEFAULT_MAX_CHARS);
+        let mut c = ComposeState::blank(Limits::default());
         let out = c.handle_key(KeyEvent {
             code: KeyCode::Esc,
             modifiers: KeyModifiers::NONE,
@@ -868,7 +891,7 @@ mod tests {
 
     #[test]
     fn over_limit_blocks_submit() {
-        let mut c = ComposeState::blank(DEFAULT_MAX_CHARS);
+        let mut c = ComposeState::blank(Limits::default());
         c.body = TextArea::from_text(&"a".repeat(DEFAULT_MAX_CHARS + 1));
         let out = c.handle_key(KeyEvent {
             code: KeyCode::Enter,
@@ -903,7 +926,7 @@ mod tests {
 
     /// Drive the whole attach flow; returns the resulting request.
     fn attach(c: &mut ComposeState, path: &Path, alt: &str) -> UploadRequest {
-        press(c, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        press(c, KeyCode::Char('o'), KeyModifiers::CONTROL);
         type_text(c, &path.to_string_lossy());
         press(c, KeyCode::Enter, KeyModifiers::NONE);
         type_text(c, alt);
@@ -916,7 +939,7 @@ mod tests {
     #[test]
     fn attach_flow_uploads_then_submits_media_only() {
         let png = temp_png("flow.png");
-        let mut c = ComposeState::blank(DEFAULT_MAX_CHARS);
+        let mut c = ComposeState::blank(Limits::default());
         let req = attach(&mut c, &png, "a cat");
         assert_eq!(req.path, png);
         assert_eq!(req.alt.as_deref(), Some("a cat"));
@@ -939,7 +962,7 @@ mod tests {
     #[test]
     fn failed_upload_drops_the_attachment() {
         let png = temp_png("fail.png");
-        let mut c = ComposeState::blank(DEFAULT_MAX_CHARS);
+        let mut c = ComposeState::blank(Limits::default());
         let req = attach(&mut c, &png, "");
         assert_eq!(req.alt, None, "an empty alt prompt means no alt text");
         assert!(c.on_upload_result(req.local_id, Err("boom".into())));
@@ -951,12 +974,12 @@ mod tests {
 
     #[test]
     fn bad_paths_keep_the_prompt_open() {
-        let mut c = ComposeState::blank(DEFAULT_MAX_CHARS);
-        press(&mut c, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        let mut c = ComposeState::blank(Limits::default());
+        press(&mut c, KeyCode::Char('o'), KeyModifiers::CONTROL);
         type_text(&mut c, "/definitely/not/here.png");
         press(&mut c, KeyCode::Enter, KeyModifiers::NONE);
         assert!(matches!(c.prompt, Some(Prompt::Path(_))));
-        assert_eq!(c.notice, Some("no such file"));
+        assert_eq!(c.notice.as_deref(), Some("no such file"));
 
         // Esc closes the prompt without cancelling the compose.
         let out = press(&mut c, KeyCode::Esc, KeyModifiers::NONE);
@@ -967,16 +990,47 @@ mod tests {
     #[test]
     fn ctrl_x_removes_the_last_attachment_and_edit_mode_refuses() {
         let png = temp_png("rm.png");
-        let mut c = ComposeState::blank(DEFAULT_MAX_CHARS);
+        let mut c = ComposeState::blank(Limits::default());
         attach(&mut c, &png, "");
         press(&mut c, KeyCode::Char('x'), KeyModifiers::CONTROL);
         assert!(c.attachments.is_empty());
 
-        let mut e = ComposeState::blank(DEFAULT_MAX_CHARS);
+        let mut e = ComposeState::blank(Limits::default());
         e.edit_of = Some(StatusId::new("9"));
-        press(&mut e, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        press(&mut e, KeyCode::Char('o'), KeyModifiers::CONTROL);
         assert!(e.prompt.is_none());
         assert!(e.notice.is_some());
+        let _ = std::fs::remove_file(png);
+    }
+
+    #[test]
+    fn paste_lands_in_the_focused_field_without_submitting() {
+        let mut c = ComposeState::blank(Limits::default());
+        c.paste("line one\r\nline two");
+        assert_eq!(c.body.text(), "line one\nline two");
+
+        c.cw_enabled = true;
+        c.focus = Focus::Spoiler;
+        c.paste("spoilers\nahead\n");
+        assert_eq!(c.spoiler.text(), "spoilers ahead");
+
+        // A file dragged onto the terminal pastes its escaped path.
+        press(&mut c, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        c.paste("/tmp/my\\ cat.png\n");
+        assert!(matches!(&c.prompt, Some(Prompt::Path(p)) if p == "/tmp/my\\ cat.png"));
+    }
+
+    #[test]
+    fn attachment_cap_follows_the_instance() {
+        let png = temp_png("cap.png");
+        let mut c = ComposeState::blank(Limits {
+            max_attachments: 1,
+            ..Limits::default()
+        });
+        attach(&mut c, &png, "");
+        press(&mut c, KeyCode::Char('o'), KeyModifiers::CONTROL);
+        assert!(c.prompt.is_none(), "a second file must be refused");
+        assert_eq!(c.notice.as_deref(), Some("attachment limit reached (1)"));
         let _ = std::fs::remove_file(png);
     }
 
@@ -1024,11 +1078,11 @@ mod tests {
     #[test]
     fn attachment_rows_and_prompt_render_above_the_footer() {
         let png = temp_png("render.png");
-        let mut c = ComposeState::blank(DEFAULT_MAX_CHARS);
+        let mut c = ComposeState::blank(Limits::default());
         type_text(&mut c, "hello");
         let req = attach(&mut c, &png, "a cat");
         c.on_upload_result(req.local_id, Ok(MediaId::new("m1")));
-        press(&mut c, KeyCode::Char('a'), KeyModifiers::CONTROL);
+        press(&mut c, KeyCode::Char('o'), KeyModifiers::CONTROL);
         type_text(&mut c, "~/pic");
 
         let name = png.file_name().unwrap().to_string_lossy().into_owned();
@@ -1039,7 +1093,7 @@ mod tests {
         let prompt = row("attach file › ~/pic").expect(&out);
         let footer = row("visibility:").expect(&out);
         assert!(att < prompt && prompt < footer, "{out}");
-        assert!(row("Ctrl+A attach").is_some(), "{out}");
+        assert!(row("Ctrl+O attach").is_some(), "{out}");
         let _ = std::fs::remove_file(png);
     }
 }

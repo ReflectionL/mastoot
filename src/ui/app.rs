@@ -13,8 +13,9 @@ use std::time::Instant;
 
 use anyhow::{Context, Result};
 use crossterm::event::{
-    Event as CEvent, EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers,
-    KeyboardEnhancementFlags, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    DisableBracketedPaste, EnableBracketedPaste, Event as CEvent, EventStream, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
@@ -44,7 +45,7 @@ use crate::ui::images::ImageCache;
 use crate::ui::screens::account_list::{AccountListOutcome, AccountListScreen};
 use crate::ui::screens::account_switcher::{AccountSwitcherScreen, SwitcherOutcome};
 use crate::ui::screens::compose::{
-    ComposeOutcome, ComposeState, DEFAULT_MAX_CHARS, quote_context_from, reply_context_from,
+    ComposeOutcome, ComposeState, Limits as ComposeLimits, quote_context_from, reply_context_from,
 };
 use crate::ui::screens::notifications::{NotifOutcome, NotificationsScreen};
 use crate::ui::screens::profile::{ProfileOutcome, ProfileScreen};
@@ -112,14 +113,16 @@ async fn main_loop(term: &mut Term, app: &mut App, handle: &mut Handle) -> Resul
         term.draw(|frame| app.render(frame))?;
 
         tokio::select! {
-            Some(Ok(event)) = keys.next() => {
-                if let CEvent::Key(k) = event
-                    && matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
-                    && !Box::pin(app.handle_key(k, &handle.actions)).await
+            Some(Ok(event)) = keys.next() => match event {
+                CEvent::Key(k)
+                    if matches!(k.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+                        && !Box::pin(app.handle_key(k, &handle.actions)).await =>
                 {
                     return Ok(());
                 }
-            }
+                CEvent::Paste(text) => app.handle_paste(&text),
+                _ => {}
+            },
             Some(ev) = handle.events.recv() => {
                 app.handle_event(ev);
                 app.flush_pending(&handle.actions).await;
@@ -185,10 +188,13 @@ struct App {
     api_health: ApiHealth,
     toasts: Vec<Toast>,
     show_help: bool,
+    /// First help line shown; clamped to the overflow at render time,
+    /// so the overlay scrolls on terminals shorter than the key list.
+    help_scroll: u16,
     mode: Mode,
-    /// Server-reported character cap for compose. Defaults to
-    /// [`DEFAULT_MAX_CHARS`] until `Event::InstanceLoaded` arrives.
-    max_chars: usize,
+    /// Server-reported compose limits (characters, attachments).
+    /// Defaults until `Event::InstanceLoaded` arrives.
+    limits: ComposeLimits,
     /// Generic mode back-stack. Sub-page entries (`l` / `r` / `c` /
     /// `u` / `5` etc.) push the current mode here so `h` / `Esc` /
     /// `Backspace` can return to it. Tab keys 1-4 clear the stack
@@ -288,8 +294,9 @@ impl App {
             api_health: ApiHealth::Healthy,
             toasts: Vec::new(),
             show_help: false,
+            help_scroll: 0,
             mode: Mode::Timeline,
-            max_chars: DEFAULT_MAX_CHARS,
+            limits: ComposeLimits::default(),
             back_stack: Vec::new(),
             me: None,
             images,
@@ -464,6 +471,10 @@ fn enter_terminal() -> Result<Term> {
     // terminals that advertise support (kitty / WezTerm / Ghostty /
     // foot / Konsole / iTerm2 with CSI-u enabled). Apple Terminal etc.
     // are left untouched. Failures are non-fatal.
+    // Bracketed paste: a paste arrives as one `Event::Paste` instead of
+    // a burst of key presses, so pasting into the timeline can't fire
+    // `f` / `b` / `d`, and pasted newlines in compose can't submit.
+    let _ = execute!(stdout, EnableBracketedPaste);
     if supports_keyboard_enhancement().unwrap_or(false) {
         let _ = execute!(
             stdout,
@@ -478,6 +489,7 @@ fn leave_terminal(term: &mut Term) {
     // Best-effort pop — if the push above was skipped or the terminal
     // ignored it, this is a no-op.
     let _ = execute!(term.backend_mut(), PopKeyboardEnhancementFlags);
+    let _ = execute!(term.backend_mut(), DisableBracketedPaste);
     let _ = disable_raw_mode();
     let _ = execute!(term.backend_mut(), LeaveAlternateScreen);
     let _ = term.show_cursor();
@@ -489,6 +501,7 @@ fn install_panic_hook() {
     let prev = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = execute!(io::stdout(), PopKeyboardEnhancementFlags);
+        let _ = execute!(io::stdout(), DisableBracketedPaste);
         let _ = disable_raw_mode();
         let _ = execute!(io::stdout(), LeaveAlternateScreen);
         prev(info);
