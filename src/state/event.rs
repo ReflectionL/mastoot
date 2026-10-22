@@ -159,10 +159,13 @@ pub enum Event {
         ancestors: Vec<Status>,
         descendants: Vec<Status>,
     },
-    /// `/api/v2/instance.configuration.statuses.max_characters` arrived;
-    /// UI should rebuild compose budgets that were using the default.
+    /// `/api/v2/instance` arrived. Each limit is `None` when the server
+    /// left it out; the UI keeps its default for that one.
     InstanceLoaded {
-        max_characters: u32,
+        /// `configuration.statuses.max_characters`.
+        max_characters: Option<u32>,
+        /// `configuration.statuses.max_media_attachments`.
+        max_media_attachments: Option<u32>,
     },
     /// `verify_credentials` finished — UI now knows who "me" is.
     CredentialsLoaded(Account),

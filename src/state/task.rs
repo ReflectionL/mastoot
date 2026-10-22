@@ -1010,7 +1010,7 @@ async fn post_status(ctx: &Ctx, draft: &StatusDraft) -> bool {
 }
 
 /// Initial (or post-switch) session kick-off: verify the token and
-/// learn the instance's `max_characters`, concurrently. Emits the same
+/// learn the instance's post limits, concurrently. Emits the same
 /// events for first boot and account-switch so the UI reuses its
 /// `CredentialsLoaded` / `InstanceLoaded` handlers.
 async fn bootstrap_session(ctx: Ctx) {
@@ -1028,15 +1028,14 @@ async fn bootstrap_session(ctx: Ctx) {
     }
     match inst {
         Ok(inst) => {
-            if let Some(max) = inst.max_characters() {
-                send(
-                    &ctx.events,
-                    Event::InstanceLoaded {
-                        max_characters: max,
-                    },
-                )
-                .await;
-            }
+            send(
+                &ctx.events,
+                Event::InstanceLoaded {
+                    max_characters: inst.max_characters(),
+                    max_media_attachments: inst.max_media_attachments(),
+                },
+            )
+            .await;
             note_api_ok(&ctx).await;
         }
         Err(e) => {

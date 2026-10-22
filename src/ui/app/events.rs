@@ -1,8 +1,8 @@
 //! Folding state-task [`Event`]s into the UI's own state.
 
 use super::{
-    Action, ApiHealth, App, ComposeState, Event, Mode, Status, TimelineKind, ToastLevel,
-    apply_revert, missing_parents,
+    Action, ApiHealth, App, ComposeLimits, ComposeState, Event, Mode, Status, TimelineKind,
+    ToastLevel, apply_revert, missing_parents,
 };
 
 impl App {
@@ -59,7 +59,7 @@ impl App {
                     && id == src.id
                     && !matches!(self.mode, Mode::Compose(_) | Mode::ComposeConfirmDiscard(_))
                 {
-                    self.push_mode(Mode::Compose(ComposeState::edit(src, vis, self.max_chars)));
+                    self.push_mode(Mode::Compose(ComposeState::edit(src, vis, self.limits)));
                 }
             }
             Event::StatusLoaded(status) => {
@@ -115,8 +115,18 @@ impl App {
                     state.on_context_loaded(ancestors, descendants);
                 }
             }
-            Event::InstanceLoaded { max_characters } => {
-                self.max_chars = max_characters as usize;
+            Event::InstanceLoaded {
+                max_characters,
+                max_media_attachments,
+            } => {
+                // A switch to an instance that omits a field falls back
+                // to the default rather than keeping the old server's.
+                let d = ComposeLimits::default();
+                self.limits = ComposeLimits {
+                    max_chars: max_characters.map_or(d.max_chars, |n| n as usize),
+                    max_attachments: max_media_attachments
+                        .map_or(d.max_attachments, |n| n as usize),
+                };
             }
             Event::CredentialsLoaded(account) => {
                 self.me = Some(account);

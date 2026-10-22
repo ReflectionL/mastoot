@@ -140,11 +140,24 @@ Press `?` in the app for the same list.
 | --- | --- |
 | `Ctrl+Enter` | send (Alt+Enter and Ctrl+D also work) |
 | `Esc` | cancel (asks first if there is a draft) |
-| `Ctrl+W` | cycle visibility |
+| `Ctrl+V` | cycle visibility |
 | `Ctrl+S` | toggle content warning |
-| `Ctrl+A` | attach a file (path, then optional alt text) |
+| `Ctrl+O` | attach a file (path, then optional alt text) |
 | `Ctrl+X` | remove the last attachment |
 | `Tab` | switch between body and content warning |
+
+**Editing text (compose, search, prompts)**
+
+| Key | Action |
+| --- | --- |
+| `⌥⌫` `Ctrl+W` | delete the word before the cursor |
+| `⌘⌫` `Ctrl+U` | delete to the start of the line |
+| `⌥⌦` `Alt+D` | delete the word after the cursor |
+| `⌘⌦` `Ctrl+K` | delete to the end of the line |
+| `⌥←` `⌥→` | move by word (also Alt+B / Alt+F, Ctrl+← / →) |
+| `⌘←` `⌘→` | start / end of line (also Ctrl+A / Ctrl+E) |
+| `⌘↑` `⌘↓` | start / end of the text |
+
 <!-- keys:end -->
 
 `Ctrl+Enter` needs the kitty keyboard protocol — WezTerm, kitty, Ghostty,
@@ -179,6 +192,15 @@ Tokens live in the OS keyring, not in the file. Logs go to
   else gets half-block art. `media_render = "text_only"` shows alt text only.
 - Copy link (`y`) uses OSC 52, so it works over SSH in the terminals above.
 - A Nerd Font is assumed for icons; set `nerd_font = false` otherwise.
+- Mac text editing (`⌥⌫`, `⌘⌫`, `⌥←` …) depends on what the terminal sends.
+  mastoot accepts every common encoding (`Alt+Backspace`, `Ctrl+W`,
+  `Ctrl+U`, `ESC b` / `ESC f`, kitty-protocol `Super`), so it usually works out of
+  the box in Ghostty and kitty. If `⌥⌫` only deletes one character, let
+  Option act as Meta (Terminal.app: *Use Option as Meta key*; iTerm2:
+  *Left Option key → Esc+*, or the *Natural Text Editing* key preset).
+  WezTerm doesn't pass `⌘⌫` on by default; add
+  `{ key = 'Backspace', mods = 'CMD', action = wezterm.action.SendString '\x15' }`
+  to `config.keys`.
 
 ## Development
 
