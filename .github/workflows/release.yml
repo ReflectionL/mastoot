@@ -132,7 +132,20 @@ jobs:
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
       - name: Install dist
-        run: ${{ matrix.install_dist.run }}
+        # Hand edit (see allow-dirty in dist-workspace.toml): downloads from
+        # github.com releases intermittently return 504, and without pipefail
+        # the `curl | sh` failure was swallowed ("dist: command not found"
+        # later). Retry the prebuilt installer, then build dist from crates.io.
+        shell: bash
+        run: |
+          for attempt in 1 2 3; do
+            if ${{ matrix.install_dist.run }}; then exit 0; fi
+            echo "dist installer failed (attempt $attempt)"
+            sleep $((attempt * 15))
+          done
+          echo "falling back to cargo install"
+          cargo install cargo-dist --version 0.31.0 --locked
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
       # Get the dist-manifest
       - name: Fetch local artifacts
         uses: actions/download-artifact@v7
