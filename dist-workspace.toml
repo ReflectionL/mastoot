@@ -22,3 +22,8 @@ install-updater = false
 # release.yml carries hand edits: a workflow_dispatch trigger (auto-tag.yml)
 # and a libdbus install step (keyring crate) before the Linux builds
 allow-dirty = ["ci"]
+
+[dist.github-custom-runners]
+# The default macos-14 runner for Apple Silicon was cancelled before a
+# runner was assigned during the v0.3.0 release (twice); use macos-15.
+aarch64-apple-darwin = "macos-15"
