@@ -48,13 +48,23 @@ pub struct Config {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeConfig {
+    /// `frost` | `ember` | `dawn` | `auto` (follow the terminal's
+    /// dark / light background).
     pub name: String,
+    /// Theme used when `name = "auto"` and the terminal is dark
+    /// (default `frost`).
+    pub dark: Option<String>,
+    /// Theme used when `name = "auto"` and the terminal is light
+    /// (default `dawn`).
+    pub light: Option<String>,
 }
 
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
             name: "frost".to_string(),
+            dark: None,
+            light: None,
         }
     }
 }

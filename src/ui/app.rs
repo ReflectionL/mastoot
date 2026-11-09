@@ -52,6 +52,7 @@ use crate::ui::screens::profile::{ProfileOutcome, ProfileScreen};
 use crate::ui::screens::search::{SearchOutcome, SearchScreen};
 use crate::ui::screens::status_detail::{DetailOutcome, DetailState};
 use crate::ui::screens::timeline::TimelineScreen;
+use crate::ui::theme::ThemeMode;
 use crate::ui::widgets::status_card::RenderPrefs;
 
 /// Size of the in-memory toast buffer. Additional toasts bump older ones.
@@ -70,6 +71,10 @@ type Term = Terminal<CrosstermBackend<io::Stdout>>;
 /// theme.
 pub async fn run(client: MastodonClient, cfg: Config) -> Result<()> {
     install_panic_hook();
+    // Probe the terminal background *before* raw mode / the event
+    // stream take over stdin; only needed for `name = "auto"`.
+    let mode = (cfg.theme.name == "auto").then(ThemeMode::detect).flatten();
+    let theme = Theme::resolve(&cfg.theme, mode);
     let mut term = enter_terminal().context("failed to enter raw mode")?;
 
     // Spawn the state task.
@@ -87,7 +92,6 @@ pub async fn run(client: MastodonClient, cfg: Config) -> Result<()> {
         .send(Action::LoadTimeline(TimelineKind::Home))
         .await;
 
-    let theme = Theme::by_name(&cfg.theme.name);
     let mut app = App::new(theme, initial_mode, cfg);
 
     let outcome = Box::pin(main_loop(&mut term, &mut app, &mut handle)).await;

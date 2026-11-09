@@ -4,6 +4,47 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::config::ThemeConfig;
+
+/// Whether the terminal background is dark or light.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeMode {
+    Dark,
+    Light,
+}
+
+impl ThemeMode {
+    /// Ask the terminal for its background colour (OSC 11), falling back
+    /// to the `COLORFGBG` environment variable, then `None`. Must run
+    /// before the TUI takes over stdin (it briefly toggles raw mode).
+    #[must_use]
+    pub fn detect() -> Option<Self> {
+        use terminal_colorsaurus::{QueryOptions, ThemeMode as Probe, theme_mode};
+        match theme_mode(QueryOptions::default()) {
+            Ok(Probe::Light) => Some(Self::Light),
+            Ok(Probe::Dark) => Some(Self::Dark),
+            Err(e) => {
+                tracing::debug!(?e, "OSC 11 background query failed; trying COLORFGBG");
+                std::env::var("COLORFGBG")
+                    .ok()
+                    .and_then(|v| Self::from_colorfgbg(&v))
+            }
+        }
+    }
+
+    /// Parse `COLORFGBG` (`"fg;bg"` or `"fg;default;bg"`, ANSI indices).
+    /// Background 7 / 15 are the light greys; 0-6 and 8 are dark.
+    #[must_use]
+    pub fn from_colorfgbg(v: &str) -> Option<Self> {
+        let bg: u8 = v.rsplit(';').next()?.trim().parse().ok()?;
+        match bg {
+            0..=6 | 8 => Some(Self::Dark),
+            7 | 9..=15 => Some(Self::Light),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Theme {
     // Three-level foreground hierarchy.
@@ -78,12 +119,49 @@ impl Theme {
         }
     }
 
-    /// Look up by config name. Unknown names fall back to `frost` silently.
+    /// Light-terminal counterpart of `frost`: same cool, restrained
+    /// hierarchy, flipped for a pale background. Every foreground keeps
+    /// at least 3:1 contrast against white (guarded by a test).
+    #[must_use]
+    pub fn dawn() -> Self {
+        Self {
+            fg_primary: Color::Rgb(36, 40, 54),
+            fg_secondary: Color::Rgb(94, 100, 120),
+            fg_tertiary: Color::Rgb(138, 144, 162),
+
+            accent: Color::Rgb(48, 82, 196),
+            mention: Color::Rgb(112, 78, 196),
+            hashtag: Color::Rgb(18, 120, 100),
+            boost: Color::Rgb(38, 128, 52),
+            favorite: Color::Rgb(176, 104, 8),
+            error: Color::Rgb(196, 48, 48),
+
+            bg: Color::Reset,
+        }
+    }
+
+    /// Look up a concrete theme by name. Unknown names (and `auto`,
+    /// which [`Theme::resolve`] handles) fall back to `frost` silently.
     #[must_use]
     pub fn by_name(name: &str) -> Self {
         match name {
             "ember" => Self::ember(),
+            "dawn" => Self::dawn(),
             _ => Self::frost(),
+        }
+    }
+
+    /// Resolve the `[theme]` config section to a theme. `name = "auto"`
+    /// picks `dark` or `light` (defaults `frost` / `dawn`) depending on
+    /// `mode`; any other name is looked up directly.
+    #[must_use]
+    pub fn resolve(cfg: &ThemeConfig, mode: Option<ThemeMode>) -> Self {
+        if cfg.name != "auto" {
+            return Self::by_name(&cfg.name);
+        }
+        match mode.unwrap_or(ThemeMode::Dark) {
+            ThemeMode::Dark => Self::by_name(cfg.dark.as_deref().unwrap_or("frost")),
+            ThemeMode::Light => Self::by_name(cfg.light.as_deref().unwrap_or("dawn")),
         }
     }
 
@@ -145,5 +223,85 @@ impl Theme {
     /// apart from prose without competing with links or mentions.
     pub fn code(self) -> Style {
         self.secondary()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[allow(clippy::many_single_char_names)]
+    fn lum(c: Color) -> f64 {
+        let Color::Rgb(r, g, b) = c else {
+            panic!("rgb only")
+        };
+        let f = |v: u8| {
+            let v = f64::from(v) / 255.0;
+            if v <= 0.03928 {
+                v / 12.92
+            } else {
+                ((v + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * f(r) + 0.7152 * f(g) + 0.0722 * f(b)
+    }
+
+    #[test]
+    fn dawn_is_readable_on_white() {
+        let t = Theme::dawn();
+        for c in [
+            t.fg_primary,
+            t.fg_secondary,
+            t.fg_tertiary,
+            t.accent,
+            t.mention,
+            t.hashtag,
+            t.boost,
+            t.favorite,
+            t.error,
+        ] {
+            let ratio = 1.05 / (lum(c) + 0.05);
+            assert!(ratio >= 3.0, "{c:?} only {ratio:.2}:1 on white");
+        }
+    }
+
+    #[test]
+    fn colorfgbg_parsing() {
+        assert_eq!(ThemeMode::from_colorfgbg("15;0"), Some(ThemeMode::Dark));
+        assert_eq!(ThemeMode::from_colorfgbg("0;15"), Some(ThemeMode::Light));
+        assert_eq!(
+            ThemeMode::from_colorfgbg("0;default;7"),
+            Some(ThemeMode::Light)
+        );
+        assert_eq!(ThemeMode::from_colorfgbg("0;default"), None);
+        assert_eq!(ThemeMode::from_colorfgbg(""), None);
+    }
+
+    fn cfg(name: &str) -> ThemeConfig {
+        ThemeConfig {
+            name: name.into(),
+            ..ThemeConfig::default()
+        }
+    }
+
+    #[test]
+    fn auto_follows_mode_and_overrides() {
+        let auto = cfg("auto");
+        assert_eq!(Theme::resolve(&auto, Some(ThemeMode::Light)), Theme::dawn());
+        assert_eq!(Theme::resolve(&auto, Some(ThemeMode::Dark)), Theme::frost());
+        assert_eq!(Theme::resolve(&auto, None), Theme::frost());
+        let custom = ThemeConfig {
+            dark: Some("ember".into()),
+            ..cfg("auto")
+        };
+        assert_eq!(
+            Theme::resolve(&custom, Some(ThemeMode::Dark)),
+            Theme::ember()
+        );
+        assert_eq!(
+            Theme::resolve(&cfg("ember"), Some(ThemeMode::Light)),
+            Theme::ember()
+        );
+        assert_eq!(Theme::resolve(&cfg("dawn"), None), Theme::dawn());
     }
 }
