@@ -176,7 +176,11 @@ default_instance = "mastodon.social"
 default_account = "you@mastodon.social"
 
 [theme]
-name = "frost"            # or "ember"
+name = "frost"            # frost | ember | dawn (light) | auto
+# auto follows the terminal background (OSC 11, then COLORFGBG):
+# dark → frost, light → dawn. Override the pair if you like:
+# dark = "ember"
+# light = "dawn"
 
 [ui]
 nerd_font = true          # false → ASCII fallbacks for icons

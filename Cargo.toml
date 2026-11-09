@@ -73,6 +73,7 @@ unicode-properties = { version = "0.1", default-features = false, features = ["e
 open = "5"
 percent-encoding = "2"
 axoupdater = "0.10"
+terminal-colorsaurus = "1.0.3"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
