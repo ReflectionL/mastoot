@@ -120,20 +120,20 @@ impl Theme {
     }
 
     /// Light-terminal counterpart of `frost`: same cool, restrained
-    /// hierarchy, flipped for a pale background. Every foreground keeps
-    /// at least 3:1 contrast against white (guarded by a test).
+    /// hierarchy, flipped for a pale background. Body text keeps ≥7:1
+    /// against white, every other foreground ≥4.5:1 (guarded by a test).
     #[must_use]
     pub fn dawn() -> Self {
         Self {
             fg_primary: Color::Rgb(36, 40, 54),
             fg_secondary: Color::Rgb(94, 100, 120),
-            fg_tertiary: Color::Rgb(138, 144, 162),
+            fg_tertiary: Color::Rgb(112, 118, 138),
 
             accent: Color::Rgb(48, 82, 196),
             mention: Color::Rgb(112, 78, 196),
             hashtag: Color::Rgb(18, 120, 100),
             boost: Color::Rgb(38, 128, 52),
-            favorite: Color::Rgb(176, 104, 8),
+            favorite: Color::Rgb(168, 98, 6),
             error: Color::Rgb(196, 48, 48),
 
             bg: Color::Reset,
@@ -249,8 +249,9 @@ mod tests {
     #[test]
     fn dawn_is_readable_on_white() {
         let t = Theme::dawn();
+        let ratio = |c: Color| 1.05 / (lum(c) + 0.05);
+        assert!(ratio(t.fg_primary) >= 7.0, "body text too light");
         for c in [
-            t.fg_primary,
             t.fg_secondary,
             t.fg_tertiary,
             t.accent,
@@ -260,9 +261,22 @@ mod tests {
             t.favorite,
             t.error,
         ] {
-            let ratio = 1.05 / (lum(c) + 0.05);
-            assert!(ratio >= 3.0, "{c:?} only {ratio:.2}:1 on white");
+            let r = ratio(c);
+            assert!(r >= 4.5, "{c:?} only {r:.2}:1 on white");
         }
+    }
+
+    #[test]
+    fn default_theme_is_auto() {
+        assert_eq!(ThemeConfig::default().name, "auto");
+        assert!(ThemeConfig::default().is_default());
+        assert!(!cfg("frost").is_default());
+    }
+
+    #[test]
+    fn default_config_does_not_pin_theme() {
+        let text = toml::to_string_pretty(&crate::config::Config::default()).unwrap();
+        assert!(!text.contains("[theme]"), "{text}");
     }
 
     #[test]

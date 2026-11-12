@@ -21,7 +21,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub instance: Option<String>,
 
-    /// Path to config file. Defaults to `~/.config/mastoot/config.toml`.
+    /// Path to config file. Defaults to the platform config dir (see README).
     #[arg(long, global = true)]
     pub config: Option<PathBuf>,
 
