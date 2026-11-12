@@ -169,14 +169,14 @@ terminals use `Alt+Enter` or `Ctrl+D`.
 
 ## Config
 
-`~/.config/mastoot/config.toml` (created on first login):
+The config file (path above, created on first login):
 
 ```toml
 default_instance = "mastodon.social"
 default_account = "you@mastodon.social"
 
 [theme]
-name = "frost"            # frost | ember | dawn (light) | auto
+name = "auto"             # auto (default) | frost | ember | dawn (light)
 # auto follows the terminal background (OSC 11, then COLORFGBG):
 # dark → frost, light → dawn. Override the pair if you like:
 # dark = "ember"

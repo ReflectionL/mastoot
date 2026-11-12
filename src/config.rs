@@ -29,7 +29,10 @@ pub struct Config {
     /// Which logged-in account to use by default, if any.
     pub default_account: Option<String>,
 
-    #[serde(default)]
+    /// Not written back while it is all defaults, so a config created
+    /// by `login` / `run` doesn't pin the theme (an explicit
+    /// `name = "frost"` would silently opt out of `auto`).
+    #[serde(default, skip_serializing_if = "ThemeConfig::is_default")]
     pub theme: ThemeConfig,
 
     #[serde(default)]
@@ -45,11 +48,11 @@ pub struct Config {
     pub accounts: Vec<AccountRef>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ThemeConfig {
     /// `frost` | `ember` | `dawn` | `auto` (follow the terminal's
-    /// dark / light background).
+    /// dark / light background; the default).
     pub name: String,
     /// Theme used when `name = "auto"` and the terminal is dark
     /// (default `frost`).
@@ -62,10 +65,18 @@ pub struct ThemeConfig {
 impl Default for ThemeConfig {
     fn default() -> Self {
         Self {
-            name: "frost".to_string(),
+            name: "auto".to_string(),
             dark: None,
             light: None,
         }
+    }
+}
+
+impl ThemeConfig {
+    /// True when nothing was customised.
+    #[must_use]
+    pub fn is_default(&self) -> bool {
+        *self == Self::default()
     }
 }
 
