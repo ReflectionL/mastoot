@@ -465,6 +465,7 @@ cargo run --example fetch_home
 
 ### Phase 5  多账号 + quote 完整链路  ·  2026-04-18
 
+- 浅色再加深 + `T` 切主题 · 2026-11-16 — dawn 正文改近黑 `(14,16,24)`（19:1）、次要 / 第三级 / 强调色整体加深（测试：正文 ≥15:1、次要 ≥9:1、第三级 ≥5.5:1）；新全局 `T` 键（compose 外）会话内循环 frost → dawn → ember，toast 提示如何写进 config；`auto` 探测不出终端深浅（OSC 11 与 `COLORFGBG` 都失败）时启动 toast 提示按 `T`，并在日志记录 `theme resolved`
 - 主题默认 auto · 2026-11-12 — 默认 `theme.name` 由 frost 改为 auto；`login` / `run` 保存配置时不再写出全默认的 `[theme]`（此前会把 `name = "frost"` 钉死，浅色终端用户永远拿不到 dawn）；dawn 次要 / 强调色加深（正文 ≥7:1，其余 ≥4.5:1，测试守护）。已有 config.toml 里写死的 frost 需手改
 - 浅色主题 · 2026-11-09 — 新 `dawn`（frost 的浅色对应，前景色对白底对比度 ≥3:1，测试守护）；`[theme] name = "auto"` 启动时用 OSC 11（`terminal-colorsaurus`，在进 raw mode / EventStream 之前探测）判断终端深浅，失败退回 `COLORFGBG`，再失败按深色；auto 下可用 `dark` / `light` 覆盖默认的 frost / dawn 配对
 - 撰写体验 · 2026-10-22 — compose 有改动时 `Ctrl+C` / `Esc` 先确认（`has_changes` 对比打开时的 prefill，回复的 `@author ` 不算改动；确认框里再按 `Ctrl+C` 直接退）；textarea 撤销/重做（快照栈 200 步，连续打字按词成组，粘贴/补全走 `checkpoint`）；`@` / `#` 补全（`Action::Complete` 在 state 层 250ms 防抖 + generation 计数，`/api/v2/search` 不 resolve，最多 5 条；`Tab` 接受、`↑↓` 选、`Esc` 收起）

@@ -41,6 +41,7 @@ pub const SECTIONS: &[Section] = &[
             b("A", "switch account"),
             b("S", "cycle live updates: streaming · polling · off"),
             b("D", "toggle inter-post density (1 ↔ 2 blank lines)"),
+            b("T", "cycle theme: frost · dawn (light) · ember"),
         ],
     },
     Section {

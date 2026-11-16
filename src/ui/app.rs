@@ -75,6 +75,10 @@ pub async fn run(client: MastodonClient, cfg: Config) -> Result<()> {
     // stream take over stdin; only needed for `name = "auto"`.
     let mode = (cfg.theme.name == "auto").then(ThemeMode::detect).flatten();
     let theme = Theme::resolve(&cfg.theme, mode);
+    tracing::info!(configured = %cfg.theme.name, detected = ?mode, "theme resolved");
+    // Auto couldn't tell → we fell back to the dark theme. Say so, since
+    // on a light terminal that is unreadable until the user presses `T`.
+    let undetected = cfg.theme.name == "auto" && mode.is_none();
     let mut term = enter_terminal().context("failed to enter raw mode")?;
 
     // Spawn the state task.
@@ -93,6 +97,12 @@ pub async fn run(client: MastodonClient, cfg: Config) -> Result<()> {
         .await;
 
     let mut app = App::new(theme, initial_mode, cfg);
+    if undetected {
+        app.push_toast(
+            ToastLevel::Warn,
+            "couldn't detect terminal background, using dark theme — press T to switch".into(),
+        );
+    }
 
     let outcome = Box::pin(main_loop(&mut term, &mut app, &mut handle)).await;
     leave_terminal(&mut term);

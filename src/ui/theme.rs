@@ -125,16 +125,19 @@ impl Theme {
     #[must_use]
     pub fn dawn() -> Self {
         Self {
-            fg_primary: Color::Rgb(36, 40, 54),
-            fg_secondary: Color::Rgb(94, 100, 120),
-            fg_tertiary: Color::Rgb(112, 118, 138),
+            // Body text is near-black (still a hint of blue so it sits
+            // with the rest of the palette); secondary / tertiary are
+            // dark enough to read at a glance on white.
+            fg_primary: Color::Rgb(14, 16, 24),
+            fg_secondary: Color::Rgb(58, 64, 84),
+            fg_tertiary: Color::Rgb(92, 98, 118),
 
-            accent: Color::Rgb(48, 82, 196),
-            mention: Color::Rgb(112, 78, 196),
-            hashtag: Color::Rgb(18, 120, 100),
-            boost: Color::Rgb(38, 128, 52),
-            favorite: Color::Rgb(168, 98, 6),
-            error: Color::Rgb(196, 48, 48),
+            accent: Color::Rgb(36, 68, 184),
+            mention: Color::Rgb(98, 64, 184),
+            hashtag: Color::Rgb(10, 108, 88),
+            boost: Color::Rgb(28, 116, 42),
+            favorite: Color::Rgb(152, 84, 0),
+            error: Color::Rgb(184, 36, 36),
 
             bg: Color::Reset,
         }
@@ -148,6 +151,19 @@ impl Theme {
             "ember" => Self::ember(),
             "dawn" => Self::dawn(),
             _ => Self::frost(),
+        }
+    }
+
+    /// Next theme in the runtime `T` cycle: frost → dawn → ember → frost.
+    /// Anything not in the list (never happens in practice) goes to frost.
+    #[must_use]
+    pub fn next_in_cycle(self) -> (&'static str, Self) {
+        if self == Self::frost() {
+            ("dawn", Self::dawn())
+        } else if self == Self::dawn() {
+            ("ember", Self::ember())
+        } else {
+            ("frost", Self::frost())
         }
     }
 
@@ -250,20 +266,25 @@ mod tests {
     fn dawn_is_readable_on_white() {
         let t = Theme::dawn();
         let ratio = |c: Color| 1.05 / (lum(c) + 0.05);
-        assert!(ratio(t.fg_primary) >= 7.0, "body text too light");
-        for c in [
-            t.fg_secondary,
-            t.fg_tertiary,
-            t.accent,
-            t.mention,
-            t.hashtag,
-            t.boost,
-            t.favorite,
-            t.error,
-        ] {
+        assert!(ratio(t.fg_primary) >= 15.0, "body text too light");
+        assert!(ratio(t.fg_secondary) >= 9.0, "secondary text too light");
+        assert!(ratio(t.fg_tertiary) >= 5.5, "tertiary text too light");
+        for c in [t.accent, t.mention, t.hashtag, t.boost, t.favorite, t.error] {
             let r = ratio(c);
             assert!(r >= 4.5, "{c:?} only {r:.2}:1 on white");
         }
+    }
+
+    #[test]
+    fn theme_cycle_visits_all_three_and_wraps() {
+        let (n1, t1) = Theme::frost().next_in_cycle();
+        let (n2, t2) = t1.next_in_cycle();
+        let (n3, t3) = t2.next_in_cycle();
+        assert_eq!((n1, n2, n3), ("dawn", "ember", "frost"));
+        assert_eq!(
+            (t1, t2, t3),
+            (Theme::dawn(), Theme::ember(), Theme::frost())
+        );
     }
 
     #[test]
