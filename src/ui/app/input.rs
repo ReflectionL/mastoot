@@ -93,6 +93,25 @@ impl App {
             return true;
         }
 
+        // Theme cycle (session only): frost → dawn → ember. Lets a light
+        // terminal flip to `dawn` without editing the config. Same
+        // compose exemption as `D` / `S`.
+        if key.code == KeyCode::Char('T')
+            && !key.modifiers.contains(KeyModifiers::CONTROL)
+            && !matches!(
+                self.mode,
+                Mode::Compose(_) | Mode::ComposeConfirmDiscard(..)
+            )
+        {
+            let (name, next) = self.theme.next_in_cycle();
+            self.theme = next;
+            self.push_toast(
+                ToastLevel::Info,
+                format!("theme: {name} (set [theme] name = \"{name}\" in config to keep it)"),
+            );
+            return true;
+        }
+
         // Live-update mode cycle: streaming → polling → off → streaming.
         // Like `D`, the `S` key works everywhere *except* compose so it
         // doesn't eat a literal S in the body.

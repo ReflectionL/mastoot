@@ -96,6 +96,7 @@ Press `?` in the app for the same list.
 | `A` | switch account |
 | `S` | cycle live updates: streaming · polling · off |
 | `D` | toggle inter-post density (1 ↔ 2 blank lines) |
+| `T` | cycle theme: frost · dawn (light) · ember |
 
 **Moving around**
 
